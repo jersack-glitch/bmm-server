@@ -15,7 +15,7 @@ not used here. claude.ai web Custom Connectors default to Streamable HTTP.
 | Variable | Value |
 |---|---|
 | `BMM_DATABASE_URL` | Supabase transaction pooler connection string (project `eejewpmmztyhwyaeoseo`, port 6543). Example: `postgresql://USER:PASSWORD@aws-0-us-west-2.pooler.supabase.com:6543/postgres` |
-| `BMM_SHARED_SECRET` | Bearer token. Generate: `node -e "console.log(require('crypto').randomUUID())"` |
+| `BMM_SHARED_SECRET` | Shared secret, passed in the connector URL as `?token=`. Generate: `node -e "console.log(require('crypto').randomUUID())"` |
 | `NODE_ENV` | `production` (skips local `.env.bmm` loading) |
 | `PORT` | Auto-set by Render — do not add manually |
 
@@ -32,12 +32,22 @@ not used here. claude.ai web Custom Connectors default to Streamable HTTP.
    ```
    Returns `{"status":"ok","service":"bmm-server","transport":"streamable-http",...}`.
 
-## Connect from claude.ai
+## Connect from claude.ai / Claude Desktop
 
 Settings → Connectors → Add custom connector:
 
-- **URL:** `https://YOUR-APP.onrender.com/mcp`
-- **Auth:** Bearer token = your `BMM_SHARED_SECRET`
+- **URL:** `https://YOUR-APP.onrender.com/mcp?token=<BMM_SHARED_SECRET>`
+- **Auth:** None
+
+Claude's connector UI only offers "None" or OAuth — there is no bearer-token / custom-header
+field ([anthropics/claude-ai-mcp#112](https://github.com/anthropics/claude-ai-mcp/issues/112)).
+So the secret rides in the URL and the connector is set to None. The server validates the
+token before any tool runs. Tradeoff: the secret is stored in the connector config and appears
+in Render request logs. OAuth 2.1 can be added later without touching the tools or transport —
+it's a separate auth layer in front of the same `/mcp` endpoint.
+
+Same URL + token for all three brokers. Kevin and Mike add it the same way in Claude Desktop,
+which retires their local stdio `bmm-server.js`.
 
 ## Local smoke test
 

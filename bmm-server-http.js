@@ -9,13 +9,17 @@
 //
 // Required env vars (set in Render dashboard):
 //   BMM_DATABASE_URL   — Supabase transaction pooler connection string
-//   BMM_SHARED_SECRET  — bearer token; clients send Authorization: Bearer <secret>
+//   BMM_SHARED_SECRET  — shared secret; clients pass it in the connector URL as ?token=<secret>
 //   PORT               — auto-set by Render
 //   NODE_ENV           — set to "production" on Render (skips local .env load)
 //
-// claude.ai Custom Connector config:
-//   URL:  https://YOUR-APP.onrender.com/mcp
-//   Auth: Bearer token = BMM_SHARED_SECRET
+// claude.ai / Claude Desktop Custom Connector config:
+//   URL:  https://YOUR-APP.onrender.com/mcp?token=<BMM_SHARED_SECRET>
+//   Auth: None
+//
+// (Claude's connector UI has no bearer-token/custom-header field — it only offers
+//  "None" or OAuth — so the secret rides in the URL. OAuth can be added later
+//  without touching the tools or transport.)
 
 const express = require('express');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
@@ -1297,11 +1301,13 @@ function createMcpServer() {
   return server;
 }
 
-// -- Auth: shared-secret bearer token --
-// Clients send `Authorization: Bearer <secret>` (also accepts x-api-key for tooling).
+// -- Auth: shared secret --
+// Primary path is the URL token (?token=<secret>), because Claude's connector UI
+// has no bearer/header field. Header forms are still accepted for API/testing use.
 function auth(req, res, next) {
   if (!SHARED_SECRET) return next(); // dev: no secret configured = open
   const token =
+    req.query.token ||
     (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
     req.headers['x-api-key'];
   if (token !== SHARED_SECRET) {
