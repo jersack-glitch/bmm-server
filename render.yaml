@@ -1,0 +1,18 @@
+# Render blueprint for the BMM MCP server (Streamable HTTP).
+# Render auto-detects this file on first deploy. Secrets are NOT committed —
+# set BMM_DATABASE_URL and BMM_SHARED_SECRET in the Render dashboard.
+services:
+  - type: web
+    name: bmm-server
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: BMM_DATABASE_URL
+        sync: false
+      - key: BMM_SHARED_SECRET
+        sync: false

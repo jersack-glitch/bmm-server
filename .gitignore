@@ -1,0 +1,6 @@
+node_modules/
+.env
+.env.bmm
+.env.local
+.DS_Store
+*.log

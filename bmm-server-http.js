@@ -1,25 +1,37 @@
 // bmm-server-http.js
-// BMM MCP Server — HTTP/SSE transport for Railway deployment
-// Drop this file alongside your existing bmm-server.js (stdio stays for local use)
+// BMM MCP Server v2.1 — Streamable HTTP transport for Render deployment
 //
-// Railway env vars required:
-//   BMM_DATABASE_URL  — Supabase transaction pooler connection string
-//   BMM_SHARED_SECRET — random string; add to Claude Desktop config as ?token=
-//   PORT              — auto-set by Railway
+// Remote variant of bmm-server.js. The stdio server (bmm-server.js) stays the
+// local entrypoint for Kevin/Mike; this file is the deployable remote server
+// that claude.ai connects to as a Custom Connector.
 //
-// Claude Desktop config (all machines):
-//   "bmm": { "url": "https://YOUR-APP.railway.app/sse?token=YOUR_SECRET" }
+// Transport: Streamable HTTP (single /mcp endpoint, stateless). SSE is deprecated.
+//
+// Required env vars (set in Render dashboard):
+//   BMM_DATABASE_URL   — Supabase transaction pooler connection string
+//   BMM_SHARED_SECRET  — bearer token; clients send Authorization: Bearer <secret>
+//   PORT               — auto-set by Render
+//   NODE_ENV           — set to "production" on Render (skips local .env load)
+//
+// claude.ai Custom Connector config:
+//   URL:  https://YOUR-APP.onrender.com/mcp
+//   Auth: Bearer token = BMM_SHARED_SECRET
 
 const express = require('express');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-const { SSEServerTransport } = require('@modelcontextprotocol/sdk/server/sse.js');
-const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types.js');
+const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
+const {
+  CallToolRequestSchema,
+  ListToolsRequestSchema
+} = require('@modelcontextprotocol/sdk/types.js');
 const { Pool } = require('pg');
 const path = require('path');
 
-// Local dev reads .env.bmm; Railway injects env vars directly
+// Local dev reads .env.bmm; Render injects env vars directly.
 if (process.env.NODE_ENV !== 'production') {
-  try { require('dotenv').config({ path: path.join(__dirname, '.env.bmm') }); } catch (_) {}
+  try {
+    require('dotenv').config({ path: path.join(__dirname, '.env.bmm'), override: true });
+  } catch (_) {}
 }
 
 const pool = new Pool({
@@ -30,87 +42,113 @@ const pool = new Pool({
 
 const SHARED_SECRET = process.env.BMM_SHARED_SECRET;
 
-// ── Auth ────────────────────────────────────────────────────────────────────
-function auth(req, res, next) {
-  if (!SHARED_SECRET) return next(); // dev: no secret = open
-  const token =
-    req.query.token ||
-    req.headers['x-api-key'] ||
-    (req.headers['authorization'] || '').replace('Bearer ', '');
-  if (token !== SHARED_SECRET) return res.status(401).json({ error: 'Unauthorized' });
-  next();
-}
-
-// ── DB helpers ───────────────────────────────────────────────────────────────
-async function dbQuery(sql, params = []) {
+// -- Helper: run query and return result --
+async function query(sql, params = []) {
   const client = await pool.connect();
-  try { return await client.query(sql, params); }
-  finally { client.release(); }
+  try {
+    const result = await client.query(sql, params);
+    return result;
+  } finally {
+    client.release();
+  }
 }
 
+// -- Helper: build SET clause from object (JSONB merge, array cast) --
 function buildUpdateClause(updates, startIdx = 1) {
   const keys = Object.keys(updates);
   const sets = keys.map((k, i) => {
     if (k === 'context') return `${k} = COALESCE(${k}, '{}'::jsonb) || $${startIdx + i}::jsonb`;
+    if (Array.isArray(updates[k])) return `${k} = $${startIdx + i}::text[]`;
     return `${k} = $${startIdx + i}`;
   });
-  const values = keys.map(k =>
-    k === 'context' && typeof updates[k] === 'object'
-      ? JSON.stringify(updates[k])
-      : updates[k]
-  );
+  const values = keys.map(k => {
+    if (k === 'context' && typeof updates[k] === 'object') return JSON.stringify(updates[k]);
+    return updates[k];
+  });
   return { clause: sets.join(', '), values };
 }
 
-function genericInsert(table, args) {
-  const keys = Object.keys(args);
-  const cols = keys.join(', ');
-  const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-  const vals = keys.map(k =>
-    k === 'expenses' && typeof args[k] === 'object' ? JSON.stringify(args[k]) : args[k]
-  );
-  return dbQuery(`INSERT INTO ${table} (${cols}) VALUES (${placeholders}) RETURNING *`, vals);
+// -- Helper: PII detection (NON-NEGOTIABLE - blocks SSN, EIN, account numbers, etc.) --
+const PII_PATTERNS = [
+  /\b\d{3}-?\d{2}-?\d{4}\b/,                          // SSN
+  /\b\d{2}-?\d{7}\b/,                                  // EIN
+  /\b\d{9,17}\b/,                                       // Bank account numbers
+  /\b(?:routing|aba|rtn)\s*#?\s*\d{9}\b/i,             // Routing with prefix
+  /\b\d{9}\b(?=.*(?:routing|aba|rtn))/i,               // Routing with suffix context
+  /\b(?:acct|account)\s*#?\s*\d{6,}\b/i,               // Account numbers with prefix
+  /\b(?:tax\s*id|tin|itin|ssn|ein)\s*[:=#]?\s*\d/i,    // Tax IDs with label
+  /\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b/,       // Credit card numbers
+];
+
+function containsPII(text) {
+  return PII_PATTERNS.some(p => p.test(text));
 }
 
-// ── Tool definitions ─────────────────────────────────────────────────────────
+// -- Valid enums for memory entries --
+const VALID_SOURCES = ['broker', 'hal_explicit', 'hal_implicit'];
+const VALID_CATEGORIES = ['identity', 'deal_context', 'relationship', 'preference', 'observation', 'action_context'];
+const VALID_CONFIDENCE = ['high', 'medium', 'low'];
+
+// -- Tool Definitions --
 const TOOLS = [
+  // == DOMAIN LOGIC: CONTACTS ==
   {
     name: 'create_contact',
-    description: 'Create a new contact. Roles: seller, buyer, referral, attorney, cpa, banker, lender, other.',
+    description: 'Create a new contact. Roles: seller, buyer, referral, attorney, cpa, banker. Industry tags: manufacturing, construction, trade-services, service, business-services, consumer-services, food-production, agriculture, retail, transportation. Context is a JSON object for unstructured notes.',
     inputSchema: {
       type: 'object',
       properties: {
-        role: { type: 'string', enum: ['seller','buyer','referral','attorney','cpa','banker','lender','other'] },
         first_name: { type: 'string' },
         last_name: { type: 'string' },
         email: { type: 'string' },
-        phone_mobile: { type: 'string' },
-        phone_work: { type: 'string' },
-        phone_home: { type: 'string' },
-        company: { type: 'string' },
+        phone: { type: 'string' },
+        phone_alt: { type: 'string' },
+        company_name: { type: 'string' },
         title: { type: 'string' },
+        website: { type: 'string' },
+        address1: { type: 'string' },
         city: { type: 'string' },
         state: { type: 'string' },
         zip: { type: 'string' },
-        address: { type: 'string' },
         county: { type: 'string' },
-        notes: { type: 'string' },
+        roles: { type: 'array', items: { type: 'string' } },
+        industry_tags: { type: 'array', items: { type: 'string' } },
         source: { type: 'string' },
-        referred_by: { type: 'string' },
-        assigned_to: { type: 'string' }
+        source_detail: { type: 'string' },
+        spouse_name: { type: 'string' },
+        spouse_email: { type: 'string' },
+        assigned_broker: { type: 'string' },
+        co_broker: { type: 'string', description: 'Secondary broker. Values: Jeremy, Kevin, Mike' },
+        follow_up_interval_days: { type: 'number', description: 'Recurring keep-warm cadence in days. When a flag resolves, next flag auto-creates at this interval.' },
+        context: { type: 'object' },
+        created_by: { type: 'string' }
       },
-      required: ['role', 'last_name']
+      required: ['first_name', 'last_name']
+    }
+  },
+  {
+    name: 'update_contact',
+    description: 'Update an existing contact. Pass contact_id and any fields to update. Context is merged (not replaced) - add new keys without losing existing ones. Supports co_broker (Jeremy/Kevin/Mike) and follow_up_interval_days for recurring keep-warm cadence.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        updates: { type: 'object', description: 'Fields to update' }
+      },
+      required: ['contact_id', 'updates']
     }
   },
   {
     name: 'search_contacts',
-    description: 'Search contacts by name, company, email, or any text. Returns up to 20 matches.',
+    description: 'Search contacts by name, company, email, or any text. Uses fuzzy matching. Optionally filter by role or industry tag.',
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string' },
-        role: { type: 'string' },
-        limit: { type: 'number', default: 20 }
+        query: { type: 'string', description: 'Search text (name, company, email)' },
+        role: { type: 'string', description: 'Filter by role: seller, buyer, referral, etc.' },
+        industry: { type: 'string', description: 'Filter by industry tag' },
+        assigned_broker: { type: 'string', description: 'Filter by broker' },
+        limit: { type: 'number', description: 'Max results (default 25)' }
       },
       required: ['query']
     }
@@ -120,331 +158,383 @@ const TOOLS = [
     description: 'Get full contact details by ID, including related entities, deals, buyer profiles, and recent interactions.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string' } },
-      required: ['id']
-    }
-  },
-  {
-    name: 'update_contact',
-    description: 'Update an existing contact. Only provided fields are updated.',
-    inputSchema: {
-      type: 'object',
       properties: {
-        id: { type: 'string' },
-        role: { type: 'string' },
-        first_name: { type: 'string' },
-        last_name: { type: 'string' },
-        email: { type: 'string' },
-        phone_mobile: { type: 'string' },
-        phone_work: { type: 'string' },
-        phone_home: { type: 'string' },
-        company: { type: 'string' },
-        title: { type: 'string' },
-        city: { type: 'string' },
-        state: { type: 'string' },
-        zip: { type: 'string' },
-        address: { type: 'string' },
-        county: { type: 'string' },
-        notes: { type: 'string' },
-        tags: { type: 'array', items: { type: 'string' } },
-        source: { type: 'string' },
-        referred_by: { type: 'string' },
-        context: { type: 'object' },
-        assigned_to: { type: 'string' }
-      },
-      required: ['id']
-    }
-  },
-  {
-    name: 'create_deal',
-    description: 'Create a new deal/listing.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        title: { type: 'string' },
-        listing_id: { type: 'string' },
-        seller_contact_id: { type: 'string' },
-        entity_id: { type: 'string' },
-        asking_price: { type: 'number' },
-        status: { type: 'string', enum: ['prospect','active','under_loi','under_contract','closed','withdrawn'], default: 'prospect' },
-        organization_type: { type: 'string' },
-        year_established: { type: 'number' },
-        business_city: { type: 'string' },
-        business_state: { type: 'string' },
-        business_address: { type: 'string' },
-        naics: { type: 'string' },
-        reason_for_sale: { type: 'string' },
-        business_overview: { type: 'string' },
-        assigned_to: { type: 'string' }
-      },
-      required: ['title']
-    }
-  },
-  {
-    name: 'get_deal',
-    description: 'Get full deal details by ID, including seller info, entity, financials, balance sheet, documents, and flags.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'string' } },
-      required: ['id']
-    }
-  },
-  {
-    name: 'list_deals',
-    description: 'List deals with optional filters.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        status: { type: 'string' },
-        assigned_to: { type: 'string' },
-        limit: { type: 'number', default: 20 }
-      }
-    }
-  },
-  {
-    name: 'update_deal',
-    description: 'Update a deal. Only provided fields are updated.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        id: { type: 'string' },
-        title: { type: 'string' },
-        status: { type: 'string', enum: ['prospect','active','under_loi','under_contract','closed','withdrawn'] },
-        asking_price: { type: 'number' },
-        engagement_price: { type: 'number' },
-        commission_rate: { type: 'number' },
-        commission_min: { type: 'number' },
-        expiration_date: { type: 'string' },
-        closing_date: { type: 'string' },
-        reason_for_sale: { type: 'string' },
-        business_overview: { type: 'string' },
-        facilities: { type: 'string' },
-        products_services: { type: 'string' },
-        competition_industry: { type: 'string' },
-        sales_marketing: { type: 'string' },
-        assets_description: { type: 'string' },
-        growth_potential: { type: 'string' },
-        showing_instructions: { type: 'string' },
-        employees_ft: { type: 'number' },
-        employees_pt: { type: 'number' },
-        inventory_value: { type: 'number' },
-        inventory_included: { type: 'boolean' },
-        ffe_value: { type: 'number' },
-        ffe_included: { type: 'boolean' },
-        ar_value: { type: 'number' },
-        ar_included: { type: 'boolean' },
-        lease_monthly_rent: { type: 'number' },
-        lease_expire_date: { type: 'string' },
-        lease_sqft: { type: 'number' }
-      },
-      required: ['id']
-    }
-  },
-  {
-    name: 'create_entity',
-    description: 'Create a business entity linked to a contact.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        contact_id: { type: 'string' },
-        entity_name: { type: 'string' },
-        entity_type: { type: 'string', enum: ['LLC','S-Corp','C-Corp','Partnership','Sole Proprietorship','Other'] },
-        ein: { type: 'string' },
-        state_of_formation: { type: 'string' },
-        formation_date: { type: 'string' },
-        registered_agent: { type: 'string' },
-        status: { type: 'string' },
-        address: { type: 'string' },
-        city: { type: 'string' },
-        state: { type: 'string' },
-        zip: { type: 'string' },
-        notes: { type: 'string' }
-      },
-      required: ['contact_id', 'entity_name']
-    }
-  },
-  {
-    name: 'create_buyer_profile',
-    description: 'Create a buyer profile (buy box) linked to a contact.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        contact_id: { type: 'string' },
-        min_price: { type: 'number' },
-        max_price: { type: 'number' },
-        preferred_industries: { type: 'array', items: { type: 'string' } },
-        preferred_locations: { type: 'array', items: { type: 'string' } },
-        financing_type: { type: 'string' },
-        notes: { type: 'string' }
+        contact_id: { type: 'string' }
       },
       required: ['contact_id']
     }
   },
+
+  // == DOMAIN LOGIC: BUYER PROFILES ==
   {
     name: 'update_buyer_profile',
-    description: 'Update a buyer profile.',
+    description: 'Update a buyer profile. Context is merged.',
     inputSchema: {
       type: 'object',
       properties: {
-        id: { type: 'string' },
-        min_price: { type: 'number' },
-        max_price: { type: 'number' },
-        preferred_industries: { type: 'array', items: { type: 'string' } },
-        preferred_locations: { type: 'array', items: { type: 'string' } },
-        financing_type: { type: 'string' },
-        notes: { type: 'string' }
+        profile_id: { type: 'string' },
+        updates: { type: 'object' }
       },
-      required: ['id']
+      required: ['profile_id', 'updates']
     }
   },
-  {
-    name: 'find_buyers',
-    description: 'Find potential buyers for a deal based on buy box criteria.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        deal_id: { type: 'string' },
-        limit: { type: 'number', default: 10 }
-      },
-      required: ['deal_id']
-    }
-  },
+
+  // == DOMAIN LOGIC: INTERACTIONS ==
   {
     name: 'log_interaction',
-    description: 'Log a meeting, call, email, showing, or note. Accepts contact_id and/or deal_id.',
+    description: 'Log a meeting, call, email, showing, or note. Links to a contact and optionally a deal. Set follow_up_date and follow_up_action to create a task.',
     inputSchema: {
       type: 'object',
       properties: {
         contact_id: { type: 'string' },
         deal_id: { type: 'string' },
-        type: { type: 'string', enum: ['meeting','call','email','showing','note','text'] },
-        direction: { type: 'string', enum: ['inbound','outbound','internal'] },
+        interaction_type: { type: 'string', description: 'meeting, call, email, showing, note, web-form' },
+        direction: { type: 'string', description: 'inbound or outbound' },
+        broker: { type: 'string' },
+        occurred_at: { type: 'string' },
         summary: { type: 'string' },
         notes: { type: 'string' },
         follow_up_date: { type: 'string' },
+        follow_up_action: { type: 'string' },
+        context: { type: 'object' },
         created_by: { type: 'string' }
       },
-      required: ['type', 'summary']
+      required: ['interaction_type', 'broker', 'summary']
     }
   },
+
+  // == DOMAIN LOGIC: FLAGS ==
   {
     name: 'create_flag',
-    description: 'Create a flag/task for follow-up.',
+    description: 'Create a flag/task for follow-up. Types: missing-doc, legal-review, valuation-needed, follow-up, data-quality, third-party. Priority: low, normal, high, urgent.',
     inputSchema: {
       type: 'object',
       properties: {
         deal_id: { type: 'string' },
         contact_id: { type: 'string' },
-        type: { type: 'string', enum: ['document','follow_up','legal','financial','compliance','other'] },
-        priority: { type: 'string', enum: ['low','medium','high','critical'], default: 'medium' },
+        flag_type: { type: 'string' },
         description: { type: 'string' },
+        priority: { type: 'string' },
+        assigned_to: { type: 'string' },
         due_date: { type: 'string' },
+        context: { type: 'object' },
         created_by: { type: 'string' }
       },
-      required: ['description']
+      required: ['flag_type', 'description']
     }
   },
   {
     name: 'list_flags',
-    description: 'List open flags, optionally filtered by broker, deal, priority, or type.',
+    description: 'List open flags, optionally filtered by broker, deal, priority, or type. Returns flags assigned to broker directly OR flags on contacts where broker is co_broker.',
     inputSchema: {
       type: 'object',
       properties: {
+        assigned_to: { type: 'string' },
         deal_id: { type: 'string' },
-        contact_id: { type: 'string' },
         priority: { type: 'string' },
-        type: { type: 'string' },
-        created_by: { type: 'string' },
-        resolved: { type: 'boolean', default: false }
+        flag_type: { type: 'string' },
+        include_resolved: { type: 'boolean' }
       }
     }
   },
   {
     name: 'resolve_flag',
-    description: 'Mark a flag as resolved.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'string' } },
-      required: ['id']
-    }
-  },
-  {
-    name: 'my_followups',
-    description: "Get open follow-ups for a broker, sorted by date.",
+    description: 'Mark a flag as resolved. If the linked contact has follow_up_interval_days set, automatically creates the next follow-up flag.',
     inputSchema: {
       type: 'object',
       properties: {
-        broker: { type: 'string', description: 'Broker name (defaults to Jeremy)' },
-        limit: { type: 'number', default: 20 }
+        flag_id: { type: 'string' },
+        resolution: { type: 'string' },
+        resolved_by: { type: 'string' }
+      },
+      required: ['flag_id']
+    }
+  },
+
+  // == DOMAIN LOGIC: MATCHING ==
+  {
+    name: 'find_buyers',
+    description: 'Find potential buyers for a deal. Returns buyers whose structured criteria overlap (industry, price range, geography) along with their full context for Claude to evaluate fit. Use this as the starting point for intelligent matching - Claude reads the context and makes judgment calls.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' },
+        price_tolerance_pct: { type: 'number', description: 'Expand price range by this % to catch near-misses (default 20)' },
+        include_flexible: { type: 'boolean', description: 'Include buyers marked price_flexible even if outside range (default true)' }
+      },
+      required: ['deal_id']
+    }
+  },
+
+  // == DOMAIN LOGIC: VIEWS ==
+  {
+    name: 'my_followups',
+    description: 'Get open follow-ups for a broker, sorted by date.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        broker: { type: 'string' },
+        days_ahead: { type: 'number', description: 'Look ahead N days (default 7)' }
+      },
+      required: ['broker']
+    }
+  },
+
+  // == DOMAIN LOGIC: MEMORY ==
+  {
+    name: 'hal_remember',
+    description: 'Write a memory entry to broker_memory_entries. PII is hard-blocked server-side. Source: broker, hal_explicit, hal_implicit. Category: identity, deal_context, relationship, preference, observation, action_context.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        broker: { type: 'string', description: 'Broker name: Jeremy, Kevin, Mike' },
+        source: { type: 'string', description: 'broker, hal_explicit, or hal_implicit' },
+        category: { type: 'string', description: 'identity, deal_context, relationship, preference, observation, action_context' },
+        content: { type: 'string', description: 'The memory entry text. No PII allowed.' },
+        contact_id: { type: 'string' },
+        deal_id: { type: 'string' },
+        interaction_id: { type: 'string' },
+        confidence: { type: 'string', description: 'high, medium, low - required for hal_explicit/hal_implicit' },
+        visibility: { type: 'string', description: 'shared (default) or private' },
+        expires_at: { type: 'string', description: 'ISO timestamp for auto-expiry, or null for permanent' }
+      },
+      required: ['broker', 'source', 'category', 'content']
+    }
+  },
+  {
+    name: 'dismiss_memory',
+    description: 'Dismiss a memory entry. Sets dismissed_at timestamp.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        memory_id: { type: 'string' },
+        dismissed_by: { type: 'string', description: 'Broker name' }
+      },
+      required: ['memory_id', 'dismissed_by']
+    }
+  },
+  {
+    name: 'get_broker_context',
+    description: 'Load broker profile, active memory entries, and session summary. Call at session start after confirming who is in the session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        broker: { type: 'string', description: 'Broker name: Jeremy, Kevin, Mike' }
+      },
+      required: ['broker']
+    }
+  },
+
+  // == CRUD: retained for Kevin/Mike (Jeremy uses bmm-supabase) ==
+  {
+    name: 'create_entity',
+    description: 'Create a business entity linked to a contact. Entity types: llc, s-corp, c-corp, partnership, sole-prop.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        legal_name: { type: 'string' },
+        dba_name: { type: 'string' },
+        entity_type: { type: 'string' },
+        state_of_formation: { type: 'string' },
+        formation_date: { type: 'string' },
+        sos_status: { type: 'string' },
+        sos_file_number: { type: 'string' },
+        registered_agent: { type: 'string' },
+        ucc_liens: { type: 'array' },
+        officers: { type: 'array' },
+        naics_code: { type: 'string' },
+        sic_code: { type: 'string' },
+        context: { type: 'object' }
+      },
+      required: ['contact_id', 'legal_name', 'entity_type']
+    }
+  },
+  {
+    name: 'create_deal',
+    description: 'Create a new deal. Deal types: listing, acquisition, valuation-only. Stages: prospect, valuation, engagement, listing-prep, active-listing, marketing, buyer-qualification, negotiation, due-diligence, closing, dead-deal.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deal_name: { type: 'string' },
+        deal_type: { type: 'string' },
+        seller_id: { type: 'string' },
+        entity_id: { type: 'string' },
+        assigned_broker: { type: 'string' },
+        stage: { type: 'string' },
+        industry_tags: { type: 'array', items: { type: 'string' } },
+        business_category: { type: 'string' },
+        business_address: { type: 'string' },
+        business_city: { type: 'string' },
+        business_state: { type: 'string' },
+        business_zip: { type: 'string' },
+        business_county: { type: 'string' },
+        year_established: { type: 'number' },
+        employees_ft: { type: 'number' },
+        employees_pt: { type: 'number' },
+        asking_price: { type: 'number' },
+        revenue: { type: 'number' },
+        sde: { type: 'number' },
+        ebitda: { type: 'number' },
+        reason_for_sale: { type: 'string' },
+        context: { type: 'object' },
+        created_by: { type: 'string' }
+      },
+      required: ['deal_name', 'deal_type', 'assigned_broker']
+    }
+  },
+  {
+    name: 'update_deal',
+    description: 'Update a deal. Context is merged. Stage changes automatically update stage_changed_at via Postgres trigger.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' },
+        updates: { type: 'object' }
+      },
+      required: ['deal_id', 'updates']
+    }
+  },
+  {
+    name: 'get_deal',
+    description: 'Get full deal details by ID, including seller info, entity, financials, balance sheet, documents, flags, and matches.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' }
+      },
+      required: ['deal_id']
+    }
+  },
+  {
+    name: 'list_deals',
+    description: 'List deals with optional filters. Great for pipeline views.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        stage: { type: 'string' },
+        assigned_broker: { type: 'string' },
+        deal_type: { type: 'string' },
+        industry: { type: 'string' },
+        limit: { type: 'number' }
       }
     }
   },
   {
-    name: 'pipeline',
-    description: 'Get pipeline summary — deal counts and values by stage, optionally filtered by broker.',
-    inputSchema: {
-      type: 'object',
-      properties: { assigned_to: { type: 'string' } }
-    }
-  },
-  {
-    name: 'save_match',
-    description: "Save a buyer-deal match with Claude's reasoning.",
+    name: 'add_financials',
+    description: 'Add a year of financial data to a deal. Upserts - if the year already exists, it updates.',
     inputSchema: {
       type: 'object',
       properties: {
-        buyer_contact_id: { type: 'string' },
         deal_id: { type: 'string' },
-        score: { type: 'number', description: '0-100' },
-        reasoning: { type: 'string' },
-        status: { type: 'string', enum: ['potential','presented','interested','declined'], default: 'potential' }
+        fiscal_year: { type: 'number' },
+        source: { type: 'string' },
+        gross_revenue: { type: 'number' },
+        cogs: { type: 'number' },
+        gross_profit: { type: 'number' },
+        owner_salary: { type: 'number' },
+        officer_compensation: { type: 'number' },
+        salaries_wages: { type: 'number' },
+        rent: { type: 'number' },
+        depreciation: { type: 'number' },
+        amortization: { type: 'number' },
+        interest: { type: 'number' },
+        total_expenses: { type: 'number' },
+        net_income: { type: 'number' },
+        total_addbacks: { type: 'number' },
+        sde: { type: 'number' },
+        adj_ebitda: { type: 'number' },
+        context: { type: 'object' }
       },
-      required: ['buyer_contact_id', 'deal_id', 'score', 'reasoning']
+      required: ['deal_id', 'fiscal_year']
+    }
+  },
+  {
+    name: 'create_buyer_profile',
+    description: 'Create a buyer profile (buy box) linked to a contact. A buyer can have multiple profiles (primary, secondary, opportunistic).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        contact_id: { type: 'string' },
+        profile_name: { type: 'string' },
+        industry_tags: { type: 'array', items: { type: 'string' } },
+        industry_exclude: { type: 'array', items: { type: 'string' } },
+        price_min: { type: 'number' },
+        price_max: { type: 'number' },
+        price_flexible: { type: 'boolean' },
+        min_revenue: { type: 'number' },
+        min_sde: { type: 'number' },
+        min_ebitda: { type: 'number' },
+        max_multiple: { type: 'number' },
+        preferred_states: { type: 'array', items: { type: 'string' } },
+        preferred_counties: { type: 'array', items: { type: 'string' } },
+        max_distance_miles: { type: 'number' },
+        relocatable: { type: 'boolean' },
+        has_cash: { type: 'number' },
+        needs_financing: { type: 'boolean' },
+        sba_prequalified: { type: 'boolean' },
+        industry_experience: { type: 'array', items: { type: 'string' } },
+        management_experience: { type: 'boolean' },
+        owns_business: { type: 'boolean' },
+        absentee_ok: { type: 'boolean' },
+        franchise_ok: { type: 'boolean' },
+        employees_max: { type: 'number' },
+        urgency: { type: 'string' },
+        target_close: { type: 'string' },
+        context: { type: 'object' },
+        created_by: { type: 'string' }
+      },
+      required: ['contact_id']
     }
   },
   {
     name: 'track_document',
-    description: "Track a document's status for a deal.",
+    description: 'Track a document status for a deal. Statuses: needed, requested, received, signed, filed. Timestamps auto-set by Postgres trigger.',
     inputSchema: {
       type: 'object',
       properties: {
         deal_id: { type: 'string' },
-        contact_id: { type: 'string' },
-        doc_type: { type: 'string', enum: ['engagement_agreement','corporate_resolution','llc_certificate','spouse_consent','disclosure','equipment_list','lease','financials','loi','apa','other'] },
-        status: { type: 'string', enum: ['requested','received','reviewed','signed','filed'], default: 'requested' },
-        filename: { type: 'string' },
-        notes: { type: 'string' }
+        doc_type: { type: 'string' },
+        doc_name: { type: 'string' },
+        status: { type: 'string' },
+        storage_url: { type: 'string' },
+        context: { type: 'object' }
       },
-      required: ['doc_type']
+      required: ['deal_id', 'doc_type']
     }
   },
   {
-    name: 'add_financials',
-    description: 'Add a year of financial data to a deal.',
+    name: 'save_match',
+    description: 'Save a buyer-deal match with reasoning. Match types: strong, moderate, near-miss.',
     inputSchema: {
       type: 'object',
       properties: {
         deal_id: { type: 'string' },
-        year: { type: 'number' },
-        source: { type: 'string', enum: ['tax_return','p&l','recast','interim'], default: 'tax_return' },
-        revenue: { type: 'number' },
-        cogs: { type: 'number' },
-        gross_profit: { type: 'number' },
-        net_income: { type: 'number' },
-        total_addbacks: { type: 'number' },
-        sde: { type: 'number' },
-        normalized_salary: { type: 'number' },
-        adj_ebitda: { type: 'number' },
-        da: { type: 'number' },
-        adj_ebit: { type: 'number' },
-        expenses: { type: 'object', description: 'Key-value pairs of expense line items' }
+        buyer_id: { type: 'string' },
+        buyer_profile_id: { type: 'string' },
+        match_type: { type: 'string' },
+        match_score: { type: 'number' },
+        reasoning: { type: 'string' },
+        matches_on: { type: 'array', items: { type: 'string' } },
+        gaps: { type: 'array', items: { type: 'string' } },
+        context: { type: 'object' }
       },
-      required: ['deal_id', 'year']
+      required: ['deal_id', 'buyer_id', 'match_type', 'reasoning']
+    }
+  },
+  {
+    name: 'pipeline',
+    description: 'Get pipeline summary - deal counts and values by stage, optionally filtered by broker.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        assigned_broker: { type: 'string' }
+      }
     }
   },
   {
     name: 'raw_query',
-    description: 'Run a raw SQL SELECT query. Read-only.',
+    description: 'Run a raw SQL SELECT query. For ad-hoc analysis only. Only SELECT statements allowed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -453,333 +543,817 @@ const TOOLS = [
       },
       required: ['sql']
     }
+  },
+  {
+    name: 'send_broker_message',
+    description: 'Send a message to another broker that surfaces at their next session start. Use for deal thoughts, heads-up notes, or anything that needs broker-to-broker attention.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        to_broker:   { type: 'string', description: 'Jeremy | Kevin | Mike' },
+        from_broker: { type: 'string', description: 'Jeremy | Kevin | Mike' },
+        message:     { type: 'string', description: 'The message content' },
+        contact_id:  { type: 'string', description: 'Optional - link to a contact' },
+        deal_id:     { type: 'string', description: 'Optional - link to a deal' }
+      },
+      required: ['to_broker', 'from_broker', 'message']
+    }
+  },
+  {
+    name: 'get_broker_messages',
+    description: 'Get unread messages for a broker. Call at session start to surface any broker-to-broker notes before the action list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        broker: { type: 'string', description: 'Jeremy | Kevin | Mike' },
+        mark_read: { type: 'boolean', description: 'Mark messages as read after retrieval. Default true.' }
+      },
+      required: ['broker']
+    }
   }
 ];
 
-// ── Tool handlers ────────────────────────────────────────────────────────────
-async function handleTool(name, args) {
-  switch (name) {
-
-    case 'create_contact': {
-      const r = await genericInsert('contacts', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'search_contacts': {
-      const { query, role, limit = 20 } = args;
-      let sql = `
-        SELECT id, role, first_name, last_name, email, phone_mobile, company, city, state, tags, assigned_to
-        FROM contacts
-        WHERE (first_name ILIKE $1 OR last_name ILIKE $1 OR email ILIKE $1 OR
-               company ILIKE $1 OR CONCAT(first_name, ' ', last_name) ILIKE $1)
-      `;
-      const params = [`%${query}%`];
-      if (role) { sql += ` AND role = $${params.length + 1}`; params.push(role); }
-      sql += ` ORDER BY last_name, first_name LIMIT $${params.length + 1}`;
-      params.push(limit);
-      const r = await dbQuery(sql, params);
-      return JSON.stringify(r.rows, null, 2);
-    }
-
-    case 'get_contact': {
-      const r = await dbQuery('SELECT * FROM contacts WHERE id = $1', [args.id]);
-      if (!r.rows.length) return 'Contact not found';
-      const contact = r.rows[0];
-      const [entities, deals, profiles, interactions] = await Promise.all([
-        dbQuery('SELECT * FROM entities WHERE contact_id = $1', [args.id]),
-        dbQuery('SELECT id, title, status, asking_price FROM deals WHERE seller_contact_id = $1', [args.id]),
-        dbQuery('SELECT * FROM buyer_profiles WHERE contact_id = $1', [args.id]),
-        dbQuery('SELECT * FROM interactions WHERE contact_id = $1 ORDER BY created_at DESC LIMIT 5', [args.id])
-      ]);
-      return JSON.stringify({
-        ...contact,
-        entities: entities.rows,
-        deals: deals.rows,
-        buyer_profiles: profiles.rows,
-        recent_interactions: interactions.rows
-      }, null, 2);
-    }
-
-    case 'update_contact': {
-      const { id, ...updates } = args;
-      if (!Object.keys(updates).length) return 'No fields to update';
-      const { clause, values } = buildUpdateClause(updates);
-      const r = await dbQuery(
-        `UPDATE contacts SET ${clause}, updated_at = NOW() WHERE id = $${values.length + 1} RETURNING *`,
-        [...values, id]
-      );
-      return r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Contact not found';
-    }
-
-    case 'create_deal': {
-      const r = await genericInsert('deals', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'get_deal': {
-      const r = await dbQuery('SELECT * FROM deals WHERE id = $1', [args.id]);
-      if (!r.rows.length) return 'Deal not found';
-      const deal = r.rows[0];
-      const [financials, docs, flags, seller] = await Promise.all([
-        dbQuery('SELECT * FROM deal_financials WHERE deal_id = $1 ORDER BY year DESC', [args.id]),
-        dbQuery('SELECT * FROM documents WHERE deal_id = $1', [args.id]),
-        dbQuery('SELECT * FROM flags WHERE deal_id = $1 AND resolved = false', [args.id]),
-        deal.seller_contact_id
-          ? dbQuery('SELECT id, first_name, last_name, email, phone_mobile, company FROM contacts WHERE id = $1', [deal.seller_contact_id])
-          : Promise.resolve({ rows: [] })
-      ]);
-      return JSON.stringify({
-        ...deal,
-        seller: seller.rows[0] || null,
-        financials: financials.rows,
-        documents: docs.rows,
-        open_flags: flags.rows
-      }, null, 2);
-    }
-
-    case 'list_deals': {
-      const { status, assigned_to, limit = 20 } = args;
-      let sql = 'SELECT id, listing_id, title, status, asking_price, business_city, business_state, assigned_to, created_at FROM deals WHERE 1=1';
-      const params = [];
-      if (status) { sql += ` AND status = $${params.length + 1}`; params.push(status); }
-      if (assigned_to) { sql += ` AND assigned_to ILIKE $${params.length + 1}`; params.push(`%${assigned_to}%`); }
-      sql += ` ORDER BY created_at DESC LIMIT $${params.length + 1}`;
-      params.push(limit);
-      const r = await dbQuery(sql, params);
-      return JSON.stringify(r.rows, null, 2);
-    }
-
-    case 'update_deal': {
-      const { id, ...updates } = args;
-      if (!Object.keys(updates).length) return 'No fields to update';
-      const { clause, values } = buildUpdateClause(updates);
-      const r = await dbQuery(
-        `UPDATE deals SET ${clause}, updated_at = NOW() WHERE id = $${values.length + 1} RETURNING *`,
-        [...values, id]
-      );
-      return r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Deal not found';
-    }
-
-    case 'create_entity': {
-      const r = await genericInsert('entities', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'create_buyer_profile': {
-      const r = await genericInsert('buyer_profiles', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'update_buyer_profile': {
-      const { id, ...updates } = args;
-      const { clause, values } = buildUpdateClause(updates);
-      const r = await dbQuery(
-        `UPDATE buyer_profiles SET ${clause} WHERE id = $${values.length + 1} RETURNING *`,
-        [...values, id]
-      );
-      return r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Profile not found';
-    }
-
-    case 'find_buyers': {
-      const { deal_id, limit = 10 } = args;
-      const deal = await dbQuery('SELECT asking_price FROM deals WHERE id = $1', [deal_id]);
-      if (!deal.rows.length) return 'Deal not found';
-      const price = deal.rows[0].asking_price || 0;
-      const r = await dbQuery(`
-        SELECT c.id, c.first_name, c.last_name, c.email, c.phone_mobile, c.company,
-               bp.id as profile_id, bp.min_price, bp.max_price,
-               bp.preferred_industries, bp.preferred_locations, bp.notes
-        FROM buyer_profiles bp
-        JOIN contacts c ON c.id = bp.contact_id
-        WHERE (bp.max_price IS NULL OR bp.max_price >= $1)
-          AND (bp.min_price IS NULL OR bp.min_price <= $2)
-        ORDER BY c.last_name
-        LIMIT $3
-      `, [price * 0.7, price * 1.3, limit]);
-      return JSON.stringify(r.rows, null, 2);
-    }
-
-    case 'log_interaction': {
-      const r = await genericInsert('interactions', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'create_flag': {
-      const r = await genericInsert('flags', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'list_flags': {
-      const { deal_id, contact_id, priority, type, created_by, resolved = false } = args;
-      let sql = `
-        SELECT f.*, d.title as deal_title, c.first_name || ' ' || c.last_name as contact_name
-        FROM flags f
-        LEFT JOIN deals d ON d.id = f.deal_id
-        LEFT JOIN contacts c ON c.id = f.contact_id
-        WHERE f.resolved = $1
-      `;
-      const params = [resolved];
-      if (deal_id) { sql += ` AND f.deal_id = $${params.length + 1}`; params.push(deal_id); }
-      if (contact_id) { sql += ` AND f.contact_id = $${params.length + 1}`; params.push(contact_id); }
-      if (priority) { sql += ` AND f.priority = $${params.length + 1}`; params.push(priority); }
-      if (type) { sql += ` AND f.type = $${params.length + 1}`; params.push(type); }
-      if (created_by) { sql += ` AND f.created_by ILIKE $${params.length + 1}`; params.push(`%${created_by}%`); }
-      sql += ' ORDER BY f.due_date ASC NULLS LAST, f.created_at DESC';
-      const r = await dbQuery(sql, params);
-      return JSON.stringify(r.rows, null, 2);
-    }
-
-    case 'resolve_flag': {
-      const r = await dbQuery(
-        'UPDATE flags SET resolved = true, resolved_at = NOW() WHERE id = $1 RETURNING *',
-        [args.id]
-      );
-      return r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Flag not found';
-    }
-
-    case 'my_followups': {
-      const { broker = 'Jeremy', limit = 20 } = args;
-      const r = await dbQuery(`
-        SELECT 'interaction' as source, i.id, i.follow_up_date as due_date,
-               i.summary, i.notes, i.created_by,
-               CONCAT(c.first_name, ' ', c.last_name) as contact_name,
-               d.title as deal_title
-        FROM interactions i
-        LEFT JOIN contacts c ON c.id = i.contact_id
-        LEFT JOIN deals d ON d.id = i.deal_id
-        WHERE i.follow_up_date IS NOT NULL
-          AND i.follow_up_date >= CURRENT_DATE
-          AND i.created_by ILIKE $1
-        UNION ALL
-        SELECT 'flag' as source, f.id, f.due_date,
-               f.description as summary, '' as notes, f.created_by,
-               CONCAT(c.first_name, ' ', c.last_name) as contact_name,
-               d.title as deal_title
-        FROM flags f
-        LEFT JOIN contacts c ON c.id = f.contact_id
-        LEFT JOIN deals d ON d.id = f.deal_id
-        WHERE f.resolved = false
-          AND f.created_by ILIKE $1
-        ORDER BY due_date ASC NULLS LAST
-        LIMIT $2
-      `, [`%${broker}%`, limit]);
-      return JSON.stringify(r.rows, null, 2);
-    }
-
-    case 'pipeline': {
-      const { assigned_to } = args;
-      let sql = `
-        SELECT status, COUNT(*) as count,
-               SUM(asking_price) as total_value,
-               AVG(asking_price) as avg_value
-        FROM deals WHERE 1=1
-      `;
-      const params = [];
-      if (assigned_to) { sql += ` AND assigned_to ILIKE $${params.length + 1}`; params.push(`%${assigned_to}%`); }
-      sql += ' GROUP BY status ORDER BY status';
-      const r = await dbQuery(sql, params);
-      return JSON.stringify(r.rows, null, 2);
-    }
-
-    case 'save_match': {
-      const { buyer_contact_id, deal_id, score, reasoning, status = 'potential' } = args;
-      const r = await dbQuery(
-        `INSERT INTO matches (buyer_contact_id, deal_id, score, reasoning, status)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-        [buyer_contact_id, deal_id, score, reasoning, status]
-      );
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'track_document': {
-      const r = await genericInsert('documents', args);
-      return JSON.stringify(r.rows[0], null, 2);
-    }
-
-    case 'add_financials': {
+// -- Tool Handlers (domain logic - identical to bmm-server.js stdio) --
+async function handleToolCall(name, args) {
+  try {
+    // -- create_contact (dedup gate) --
+    if (name === 'create_contact') {
+      if (args.email) {
+        const existing = await query(
+          `SELECT id, first_name, last_name, email FROM contacts WHERE email ILIKE $1 AND status != 'deleted' LIMIT 1`,
+          [args.email]
+        );
+        if (existing.rows.length > 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                duplicate_detected: true,
+                existing_contact: existing.rows[0],
+                message: `Contact with email ${args.email} already exists. Use update_contact to modify.`
+              }, null, 2)
+            }]
+          };
+        }
+      }
       const fields = { ...args };
-      if (fields.expenses && typeof fields.expenses === 'object') {
-        fields.expenses = JSON.stringify(fields.expenses);
-      }
-      const keys = Object.keys(fields);
-      const updateKeys = keys.filter(k => k !== 'deal_id' && k !== 'year');
-      const r = await dbQuery(`
-        INSERT INTO deal_financials (${keys.join(', ')})
-        VALUES (${keys.map((_, i) => `$${i + 1}`).join(', ')})
-        ON CONFLICT (deal_id, year)
-        DO UPDATE SET ${updateKeys.map(k => `${k} = EXCLUDED.${k}`).join(', ')}
-        RETURNING *
-      `, keys.map(k => fields[k]));
-      return JSON.stringify(r.rows[0], null, 2);
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (['roles', 'industry_tags'].includes(columns[i])) return `$${i + 1}::text[]`;
+        if (columns[i] === 'context') return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO contacts (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
     }
 
-    case 'raw_query': {
-      const normalized = args.sql.trim().toUpperCase();
-      if (!normalized.startsWith('SELECT') && !normalized.startsWith('WITH')) {
-        return 'Error: Only SELECT/WITH queries permitted';
-      }
-      const r = await dbQuery(args.sql, args.params || []);
-      return JSON.stringify(r.rows, null, 2);
+    // -- update_contact (JSONB merge) --
+    if (name === 'update_contact') {
+      const { clause, values } = buildUpdateClause(args.updates);
+      values.push(args.contact_id);
+      const result = await query(
+        `UPDATE contacts SET ${clause} WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
     }
 
-    default:
-      return `Unknown tool: ${name}`;
+    // -- search_contacts --
+    if (name === 'search_contacts') {
+      let sql = `SELECT id, first_name, last_name, company_name, email, phone, roles, industry_tags, assigned_broker, co_broker, status, context
+           FROM contacts WHERE status != 'deleted' AND (
+             search_text ILIKE '%' || $1 || '%'
+             OR email ILIKE '%' || $1 || '%'
+           )`;
+      const params = [args.query];
+      let idx = 2;
+
+      if (args.role) {
+        sql += ` AND $${idx} = ANY(roles)`;
+        params.push(args.role);
+        idx++;
+      }
+      if (args.industry) {
+        sql += ` AND $${idx} = ANY(industry_tags)`;
+        params.push(args.industry);
+        idx++;
+      }
+      if (args.assigned_broker) {
+        sql += ` AND assigned_broker = $${idx}`;
+        params.push(args.assigned_broker);
+        idx++;
+      }
+      sql += ` ORDER BY last_name, first_name LIMIT $${idx}`;
+      params.push(args.limit || 25);
+
+      const result = await query(sql, params);
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    }
+
+    // -- get_contact (multi-table join + memory) --
+    if (name === 'get_contact') {
+      const contact = await query('SELECT * FROM contacts WHERE id = $1', [args.contact_id]);
+      const entities = await query('SELECT * FROM entities WHERE contact_id = $1', [args.contact_id]);
+      const deals = await query('SELECT * FROM deals WHERE seller_id = $1 OR buyer_id = $1', [args.contact_id]);
+      const profiles = await query('SELECT * FROM buyer_profiles WHERE contact_id = $1', [args.contact_id]);
+      const interactions = await query(
+        'SELECT * FROM interactions WHERE contact_id = $1 ORDER BY occurred_at DESC LIMIT 10',
+        [args.contact_id]
+      );
+      const memory = await query(
+        `SELECT * FROM shared_memory WHERE contact_id = $1 ORDER BY category, created_at DESC`,
+        [args.contact_id]
+      );
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            contact: contact.rows[0],
+            entities: entities.rows,
+            deals: deals.rows,
+            buyer_profiles: profiles.rows,
+            recent_interactions: interactions.rows,
+            memory_entries: memory.rows
+          }, null, 2)
+        }]
+      };
+    }
+
+    // -- update_buyer_profile (JSONB merge) --
+    if (name === 'update_buyer_profile') {
+      const { clause, values } = buildUpdateClause(args.updates);
+      values.push(args.profile_id);
+      const result = await query(
+        `UPDATE buyer_profiles SET ${clause} WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- log_interaction --
+    if (name === 'log_interaction') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (columns[i] === 'context') return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO interactions (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- create_flag --
+    if (name === 'create_flag') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (columns[i] === 'context') return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO flags (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- list_flags (co_broker JOIN, priority ordering) --
+    if (name === 'list_flags') {
+      let sql = 'SELECT f.*, d.deal_name, c.first_name || \' \' || c.last_name AS contact_name FROM flags f LEFT JOIN deals d ON f.deal_id = d.id LEFT JOIN contacts c ON f.contact_id = c.id WHERE 1=1';
+      const params = [];
+      let idx = 1;
+
+      if (!args.include_resolved) { sql += ` AND f.status != 'resolved'`; }
+      if (args.assigned_to) {
+        sql += ` AND (f.assigned_to = $${idx} OR c.co_broker = $${idx})`;
+        params.push(args.assigned_to);
+        idx++;
+      }
+      if (args.deal_id) { sql += ` AND f.deal_id = $${idx}`; params.push(args.deal_id); idx++; }
+      if (args.priority) { sql += ` AND f.priority = $${idx}`; params.push(args.priority); idx++; }
+      if (args.flag_type) { sql += ` AND f.flag_type = $${idx}`; params.push(args.flag_type); idx++; }
+      sql += ' ORDER BY CASE f.priority WHEN \'urgent\' THEN 1 WHEN \'high\' THEN 2 WHEN \'normal\' THEN 3 WHEN \'low\' THEN 4 END, f.due_date NULLS LAST';
+
+      const result = await query(sql, params);
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    }
+
+    // -- resolve_flag (auto-cadence scheduling) --
+    if (name === 'resolve_flag') {
+      const result = await query(
+        `UPDATE flags SET status = 'resolved', resolved_at = NOW(), resolved_by = $1, resolution = $2 WHERE id = $3 RETURNING *`,
+        [args.resolved_by || null, args.resolution || null, args.flag_id]
+      );
+      const resolvedFlag = result.rows[0];
+
+      let nextFlag = null;
+      if (resolvedFlag && resolvedFlag.contact_id) {
+        const contact = await query(
+          `SELECT follow_up_interval_days, assigned_broker FROM contacts WHERE id = $1`,
+          [resolvedFlag.contact_id]
+        );
+        const c = contact.rows[0];
+        if (c && c.follow_up_interval_days) {
+          const existing = await query(
+            `SELECT id FROM flags WHERE contact_id = $1 AND status != 'resolved' AND flag_type = $2 LIMIT 1`,
+            [resolvedFlag.contact_id, resolvedFlag.flag_type]
+          );
+          if (existing.rows.length === 0) {
+            const next = await query(
+              `INSERT INTO flags (contact_id, flag_type, description, priority, assigned_to, due_date, created_by)
+               VALUES ($1, $2, $3, $4, $5, CURRENT_DATE + $6::integer, $7)
+               RETURNING *`,
+              [
+                resolvedFlag.contact_id,
+                resolvedFlag.flag_type,
+                resolvedFlag.description,
+                resolvedFlag.priority || 'normal',
+                resolvedFlag.assigned_to,
+                c.follow_up_interval_days,
+                args.resolved_by || null
+              ]
+            );
+            nextFlag = next.rows[0];
+          } else {
+            nextFlag = { duplicate_skipped: true, existing_flag_id: existing.rows[0].id };
+          }
+        }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            resolved: resolvedFlag,
+            next_flag: nextFlag
+          }, null, 2)
+        }]
+      };
+    }
+
+    // -- find_buyers (multi-criteria matching) --
+    if (name === 'find_buyers') {
+      const deal = await query('SELECT * FROM deals WHERE id = $1', [args.deal_id]);
+      if (deal.rows.length === 0) return { content: [{ type: 'text', text: 'Deal not found' }] };
+
+      const d = deal.rows[0];
+      const tolerance = (args.price_tolerance_pct || 20) / 100;
+      const includeFlexible = args.include_flexible !== false;
+      const priceLow = d.asking_price ? d.asking_price * (1 - tolerance) : 0;
+      const priceHigh = d.asking_price ? d.asking_price * (1 + tolerance) : 999999999;
+
+      let sql = `
+        SELECT
+          bp.*,
+          c.id AS contact_id, c.first_name, c.last_name, c.email, c.phone,
+          c.company_name, c.city, c.state, c.context AS contact_context
+        FROM buyer_profiles bp
+        JOIN contacts c ON bp.contact_id = c.id
+        WHERE c.status = 'active'
+        AND 'buyer' = ANY(c.roles)
+        AND (
+          bp.industry_tags && $1::text[]
+          OR (bp.price_min IS NULL OR bp.price_min <= $3)
+          AND (bp.price_max IS NULL OR bp.price_max >= $2)
+      `;
+      const params = [d.industry_tags || [], priceLow, priceHigh];
+
+      if (includeFlexible) {
+        sql += ` OR bp.price_flexible = true`;
+      }
+      sql += `)`;
+      if (d.industry_tags && d.industry_tags.length > 0) {
+        sql += ` AND NOT (bp.industry_exclude && $4::text[])`;
+        params.push(d.industry_tags);
+      }
+      sql += ` ORDER BY c.last_name`;
+
+      const result = await query(sql, params);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            deal: { id: d.id, name: d.deal_name, asking_price: d.asking_price, industry: d.industry_tags, city: d.business_city, context: d.context },
+            candidate_count: result.rows.length,
+            candidates: result.rows
+          }, null, 2)
+        }]
+      };
+    }
+
+    // -- my_followups (co_broker visibility) --
+    if (name === 'my_followups') {
+      const daysAhead = args.days_ahead || 7;
+      const result = await query(
+        `SELECT f.* FROM open_followups f
+         LEFT JOIN contacts c ON f.contact_id = c.id
+         WHERE (f.broker = $1 OR c.co_broker = $1)
+         AND f.follow_up_date <= CURRENT_DATE + $2::integer
+         ORDER BY f.follow_up_date`,
+        [args.broker, daysAhead]
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    }
+
+    // == MEMORY handlers ==
+
+    // -- hal_remember (PII hard-block enforced server-side) --
+    if (name === 'hal_remember') {
+      // NON-NEGOTIABLE: Block PII
+      if (containsPII(args.content)) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error: 'PII_BLOCKED',
+              message: 'Content contains patterns matching PII (SSN, EIN, account numbers, tax IDs, credit card numbers). Memory entry rejected. Rephrase without sensitive identifiers.'
+            }, null, 2)
+          }]
+        };
+      }
+
+      // Validate source
+      if (!VALID_SOURCES.includes(args.source)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'INVALID_SOURCE', valid: VALID_SOURCES }) }] };
+      }
+
+      // Validate category
+      if (!VALID_CATEGORIES.includes(args.category)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'INVALID_CATEGORY', valid: VALID_CATEGORIES }) }] };
+      }
+
+      // Require confidence for HAL entries
+      if (args.source !== 'broker' && !args.confidence) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'CONFIDENCE_REQUIRED', message: 'confidence (high/medium/low) is required for hal_explicit and hal_implicit entries' }) }] };
+      }
+      if (args.confidence && !VALID_CONFIDENCE.includes(args.confidence)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'INVALID_CONFIDENCE', valid: VALID_CONFIDENCE }) }] };
+      }
+
+      // Look up broker_id
+      const broker = await query(
+        `SELECT id FROM broker_profiles WHERE broker_name = $1 AND active = true`,
+        [args.broker]
+      );
+      if (broker.rows.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'BROKER_NOT_FOUND', broker: args.broker }) }] };
+      }
+      const brokerId = broker.rows[0].id;
+
+      // Build INSERT
+      const fields = {
+        broker_id: brokerId,
+        source: args.source,
+        category: args.category,
+        content: args.content,
+        visibility: args.visibility || 'shared',
+        pii_confirmed_clean: true
+      };
+      if (args.contact_id) fields.contact_id = args.contact_id;
+      if (args.deal_id) fields.deal_id = args.deal_id;
+      if (args.interaction_id) fields.interaction_id = args.interaction_id;
+      if (args.confidence) fields.confidence = args.confidence;
+      if (args.expires_at) fields.expires_at = args.expires_at;
+      if (args.visibility === 'private') fields.private_broker_id = brokerId;
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => `$${i + 1}`);
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO broker_memory_entries (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- dismiss_memory --
+    if (name === 'dismiss_memory') {
+      const result = await query(
+        `UPDATE broker_memory_entries SET dismissed_at = NOW(), dismissed_by = $1 WHERE id = $2 RETURNING *`,
+        [args.dismissed_by, args.memory_id]
+      );
+      if (result.rows.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'MEMORY_NOT_FOUND', id: args.memory_id }) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- get_broker_context --
+    if (name === 'get_broker_context') {
+      const broker = await query(
+        `SELECT * FROM broker_profiles WHERE broker_name = $1`,
+        [args.broker]
+      );
+      if (broker.rows.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'BROKER_NOT_FOUND', broker: args.broker }) }] };
+      }
+      const profile = broker.rows[0];
+
+      // Update last_session_at
+      await query(
+        `UPDATE broker_profiles SET last_session_at = NOW() WHERE id = $1`,
+        [profile.id]
+      );
+
+      // Get active memory entries (shared + this broker's private)
+      const memory = await query(
+        `SELECT * FROM broker_memory_entries
+         WHERE deleted_at IS NULL
+           AND dismissed_at IS NULL
+           AND archived_at IS NULL
+           AND (expires_at IS NULL OR expires_at > NOW())
+           AND (visibility = 'shared' OR private_broker_id = $1)
+         ORDER BY category, created_at DESC`,
+        [profile.id]
+      );
+
+      // Session summary
+      const dealCount = await query(
+        `SELECT COUNT(*) as count FROM active_deals WHERE assigned_broker = $1`,
+        [args.broker]
+      );
+      const flagCount = await query(
+        `SELECT COUNT(*) as count FROM open_flags WHERE assigned_to = $1`,
+        [args.broker]
+      );
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            profile: profile,
+            memory_entries: memory.rows,
+            session_summary: {
+              active_deals: parseInt(dealCount.rows[0].count),
+              open_flags: parseInt(flagCount.rows[0].count)
+            }
+          }, null, 2)
+        }]
+      };
+    }
+
+    // == CRUD handlers: retained for Kevin/Mike (Jeremy uses bmm-supabase) ==
+
+    // -- create_entity --
+    if (name === 'create_entity') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+      if (fields.ucc_liens) fields.ucc_liens = JSON.stringify(fields.ucc_liens);
+      if (fields.officers) fields.officers = JSON.stringify(fields.officers);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (['context', 'ucc_liens', 'officers'].includes(columns[i])) return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO entities (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- create_deal --
+    if (name === 'create_deal') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (columns[i] === 'industry_tags') return `$${i + 1}::text[]`;
+        if (columns[i] === 'context') return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO deals (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- update_deal (stage_changed_at handled by Postgres trigger) --
+    if (name === 'update_deal') {
+      const { clause, values } = buildUpdateClause(args.updates);
+      values.push(args.deal_id);
+      const result = await query(
+        `UPDATE deals SET ${clause} WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- get_deal (+ memory) --
+    if (name === 'get_deal') {
+      const deal = await query('SELECT * FROM deals WHERE id = $1', [args.deal_id]);
+      if (deal.rows.length === 0) return { content: [{ type: 'text', text: 'Deal not found' }] };
+
+      const d = deal.rows[0];
+      const seller = d.seller_id ? await query('SELECT * FROM contacts WHERE id = $1', [d.seller_id]) : { rows: [] };
+      const entity = d.entity_id ? await query('SELECT * FROM entities WHERE id = $1', [d.entity_id]) : { rows: [] };
+      const financials = await query('SELECT * FROM deal_financials WHERE deal_id = $1 ORDER BY fiscal_year DESC', [args.deal_id]);
+      const balance = await query('SELECT * FROM deal_balance_sheet WHERE deal_id = $1', [args.deal_id]);
+      const docs = await query('SELECT * FROM documents WHERE deal_id = $1', [args.deal_id]);
+      const flags = await query("SELECT * FROM flags WHERE deal_id = $1 AND status != 'resolved'", [args.deal_id]);
+      const matches = await query('SELECT m.*, c.first_name, c.last_name, c.company_name FROM matches m JOIN contacts c ON m.buyer_id = c.id WHERE m.deal_id = $1', [args.deal_id]);
+      const memory = await query(
+        `SELECT * FROM shared_memory WHERE deal_id = $1 ORDER BY category, created_at DESC`,
+        [args.deal_id]
+      );
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            deal: d,
+            seller: seller.rows[0] || null,
+            entity: entity.rows[0] || null,
+            financials: financials.rows,
+            balance_sheet: balance.rows[0] || null,
+            documents: docs.rows,
+            open_flags: flags.rows,
+            matches: matches.rows,
+            memory_entries: memory.rows
+          }, null, 2)
+        }]
+      };
+    }
+
+    // -- list_deals --
+    if (name === 'list_deals') {
+      let sql = 'SELECT d.*, c.first_name || \' \' || c.last_name AS seller_name FROM deals d LEFT JOIN contacts c ON d.seller_id = c.id WHERE 1=1';
+      const params = [];
+      let idx = 1;
+
+      if (args.stage) { sql += ` AND d.stage = $${idx}`; params.push(args.stage); idx++; }
+      if (args.assigned_broker) { sql += ` AND d.assigned_broker = $${idx}`; params.push(args.assigned_broker); idx++; }
+      if (args.deal_type) { sql += ` AND d.deal_type = $${idx}`; params.push(args.deal_type); idx++; }
+      if (args.industry) { sql += ` AND $${idx} = ANY(d.industry_tags)`; params.push(args.industry); idx++; }
+      sql += ` ORDER BY d.updated_at DESC LIMIT $${idx}`;
+      params.push(args.limit || 25);
+
+      const result = await query(sql, params);
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    }
+
+    // -- add_financials (upsert) --
+    if (name === 'add_financials') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (columns[i] === 'context') return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO deal_financials (${columns.join(', ')}) VALUES (${placeholders.join(', ')})
+         ON CONFLICT (deal_id, fiscal_year) DO UPDATE SET ${columns.filter(c => c !== 'deal_id' && c !== 'fiscal_year').map(c => `${c} = EXCLUDED.${c}`).join(', ')}
+         RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- create_buyer_profile --
+    if (name === 'create_buyer_profile') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        const col = columns[i];
+        if (col === 'context') return `$${i + 1}::jsonb`;
+        if (['industry_tags', 'industry_exclude', 'preferred_states', 'preferred_counties', 'industry_experience'].includes(col)) return `$${i + 1}::text[]`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO buyer_profiles (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- track_document (timestamps handled by Postgres trigger) --
+    if (name === 'track_document') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        if (columns[i] === 'context') return `$${i + 1}::jsonb`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO documents (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- save_match --
+    if (name === 'save_match') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => {
+        const col = columns[i];
+        if (col === 'context') return `$${i + 1}::jsonb`;
+        if (['matches_on', 'gaps'].includes(col)) return `$${i + 1}::text[]`;
+        return `$${i + 1}`;
+      });
+      const values = columns.map(k => fields[k]);
+
+      const result = await query(
+        `INSERT INTO matches (${columns.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- pipeline --
+    if (name === 'pipeline') {
+      let sql = 'SELECT * FROM pipeline_summary';
+      const params = [];
+      if (args.assigned_broker) {
+        sql = `SELECT * FROM pipeline_summary WHERE assigned_broker = $1`;
+        params.push(args.assigned_broker);
+      }
+      const result = await query(sql, params);
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    }
+
+    // -- raw_query (SELECT only) --
+    if (name === 'raw_query') {
+      const trimmed = args.sql.trim().toUpperCase();
+      if (!trimmed.startsWith('SELECT')) {
+        return { content: [{ type: 'text', text: 'Only SELECT queries allowed via raw_query.' }] };
+      }
+      const result = await query(args.sql, args.params || []);
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    }
+
+    // -- send_broker_message --
+    if (name === 'send_broker_message') {
+      const { to_broker, from_broker, message, contact_id, deal_id } = args;
+      const fields = { to_broker, from_broker, message };
+      if (contact_id) fields.contact_id = contact_id;
+      if (deal_id) fields.deal_id = deal_id;
+      const columns = Object.keys(fields);
+      const placeholders = columns.map((_, i) => `$${i + 1}`);
+      const values = columns.map(k => fields[k]);
+      const result = await query(
+        `INSERT INTO broker_messages (${columns.join(', ')})
+         VALUES (${placeholders.join(', ')}) RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
+    }
+
+    // -- get_broker_messages --
+    if (name === 'get_broker_messages') {
+      const { broker, mark_read = true } = args;
+      const messages = await query(
+        `SELECT m.*,
+                c.first_name || ' ' || c.last_name AS contact_name,
+                d.deal_name
+         FROM broker_messages m
+         LEFT JOIN contacts c ON m.contact_id = c.id
+         LEFT JOIN deals d ON m.deal_id = d.id
+         WHERE m.to_broker = $1
+           AND m.read_at IS NULL
+           AND m.deleted_at IS NULL
+         ORDER BY m.created_at ASC`,
+        [broker]
+      );
+      if (mark_read && messages.rows.length > 0) {
+        const ids = messages.rows.map(r => r.id);
+        await query(
+          `UPDATE broker_messages SET read_at = NOW()
+           WHERE id = ANY($1::uuid[])`,
+          [ids]
+        );
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(messages.rows, null, 2) }] };
+    }
+
+    return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
+
+  } catch (error) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: error.message,
+          tool: name,
+          detail: error.detail || null,
+          hint: error.hint || null
+        })
+      }]
+    };
   }
 }
 
-// ── MCP Server factory (one instance per SSE connection) ────────────────────
-function createMCPServer() {
+// -- MCP Server factory (one instance per request in stateless mode) --
+function createMcpServer() {
   const server = new Server(
-    { name: 'bmm-server', version: '1.0.0' },
+    { name: 'bmm-server', version: '2.1.0' },
     { capabilities: { tools: {} } }
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    try {
-      const text = await handleTool(name, args || {});
-      return { content: [{ type: 'text', text }] };
-    } catch (error) {
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({ error: error.message, tool: name, detail: error.detail || null })
-        }]
-      };
-    }
+    return handleToolCall(name, args || {});
   });
   return server;
 }
 
-// ── Express app ──────────────────────────────────────────────────────────────
+// -- Auth: shared-secret bearer token --
+// Clients send `Authorization: Bearer <secret>` (also accepts x-api-key for tooling).
+function auth(req, res, next) {
+  if (!SHARED_SECRET) return next(); // dev: no secret configured = open
+  const token =
+    (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
+    req.headers['x-api-key'];
+  if (token !== SHARED_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// -- Express app --
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '4mb' }));
 
-// Active SSE transports keyed by sessionId
-const transports = {};
-
-// Health check — Railway uses this to verify the service is up
+// Health check — Render uses this to verify the service is up (no auth).
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'bmm-server', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'bmm-server', transport: 'streamable-http', timestamp: new Date().toISOString() });
 });
 
-// SSE endpoint — Claude Desktop connects here
-app.get('/sse', auth, async (req, res) => {
-  const mcpServer = createMCPServer();
-  const transport = new SSEServerTransport('/messages', res);
-  transports[transport.sessionId] = transport;
-  res.on('close', () => delete transports[transport.sessionId]);
-  await mcpServer.connect(transport);
+// MCP endpoint — Streamable HTTP, stateless. claude.ai connects here.
+app.post('/mcp', auth, async (req, res) => {
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  res.on('close', () => {
+    transport.close();
+    server.close();
+  });
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP request error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null
+      });
+    }
+  }
 });
 
-// Message endpoint — Claude Desktop posts tool calls here
-app.post('/messages', auth, async (req, res) => {
-  const transport = transports[req.query.sessionId];
-  if (!transport) return res.status(404).json({ error: 'Session not found' });
-  await transport.handlePostMessage(req, res);
-});
+// Stateless mode does not support server-initiated GET streams or DELETE sessions.
+const methodNotAllowed = (req, res) => {
+  res.status(405).json({
+    jsonrpc: '2.0',
+    error: { code: -32000, message: 'Method not allowed. This server is stateless; use POST /mcp.' },
+    id: null
+  });
+};
+app.get('/mcp', methodNotAllowed);
+app.delete('/mcp', methodNotAllowed);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`BMM MCP Server (HTTP) running on port ${PORT}`);
+  console.log(`BMM MCP Server v2.1 (Streamable HTTP) running on port ${PORT}`);
 });
