@@ -574,6 +574,91 @@ const TOOLS = [
       },
       required: ['broker']
     }
+  },
+  {
+    name: 'add_balance_sheet',
+    description: 'Add or update a deal balance sheet. One per deal: updates the existing non-deleted row if present, otherwise inserts. Values are point-in-time (as_of_date).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        deal_id: { type: 'string' },
+        as_of_date: { type: 'string' },
+        cash: { type: 'number' },
+        accounts_receivable: { type: 'number' },
+        inventory: { type: 'number' },
+        leasehold_improvements: { type: 'number' },
+        furniture_fixtures: { type: 'number' },
+        equipment: { type: 'number' },
+        vehicles: { type: 'number' },
+        buildings: { type: 'number' },
+        land: { type: 'number' },
+        accumulated_depreciation: { type: 'number' },
+        other_assets: { type: 'number' },
+        total_assets: { type: 'number' },
+        accounts_payable: { type: 'number' },
+        bank_debt: { type: 'number' },
+        current_notes_payable: { type: 'number' },
+        accrued_expense: { type: 'number' },
+        lt_notes_payable: { type: 'number' },
+        lt_lease_payable: { type: 'number' },
+        other_liabilities: { type: 'number' },
+        total_liabilities: { type: 'number' },
+        equity: { type: 'number' },
+        recast_data: { type: 'object' },
+        context: { type: 'object' }
+      },
+      required: ['deal_id']
+    }
+  },
+  {
+    name: 'update_document',
+    description: 'Update a document by id. Status transitions: needed, requested, received, reviewed, signed, filed. The requested_at/received_at/signed_at timestamps are auto-set by a Postgres trigger.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        document_id: { type: 'string' },
+        updates: { type: 'object', description: 'Fields: status, storage_url, doc_name, doc_type, context' }
+      },
+      required: ['document_id', 'updates']
+    }
+  },
+  {
+    name: 'update_match',
+    description: 'Update a saved match by id. Advance outcome (live, under_loi, dead, passed, withdrawn, closed); record contacted, contacted_by, contacted_at, response. A non-live outcome requires reasoning (>=20 chars) and contacted_by to be set on the row.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        match_id: { type: 'string' },
+        updates: { type: 'object', description: 'Fields: outcome, contacted, contacted_by, contacted_at, response, match_type, match_score, reasoning, matches_on, gaps, context' }
+      },
+      required: ['match_id', 'updates']
+    }
+  },
+  {
+    name: 'update_entity',
+    description: 'Update a business entity by id. context is merged (not replaced); ucc_liens and officers are JSON arrays.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        entity_id: { type: 'string' },
+        updates: { type: 'object', description: 'Fields: legal_name, dba_name, entity_type, state_of_formation, formation_date, sos_status, sos_file_number, registered_agent, ucc_liens, officers, naics_code, sic_code, context' }
+      },
+      required: ['entity_id', 'updates']
+    }
+  },
+  {
+    name: 'update_broker_profile',
+    description: 'Write the broker_memory JSONB scratchpad (merged into existing, not replaced) and basic profile fields for a broker. broker_memory is broker-controlled freeform JSON; companion to get_broker_context.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        broker: { type: 'string', description: 'Jeremy, Kevin, Mike' },
+        broker_memory: { type: 'object', description: 'JSON merged into existing broker_memory' },
+        email: { type: 'string' },
+        phone: { type: 'string' }
+      },
+      required: ['broker']
+    }
   }
 ];
 
@@ -1268,6 +1353,112 @@ async function handleToolCall(name, args) {
         );
       }
       return { content: [{ type: 'text', text: JSON.stringify(messages.rows, null, 2) }] };
+    }
+
+    // -- add_balance_sheet (one per deal: update existing else insert) --
+    if (name === 'add_balance_sheet') {
+      const fields = { ...args };
+      if (fields.context) fields.context = JSON.stringify(fields.context);
+      if (fields.recast_data) fields.recast_data = JSON.stringify(fields.recast_data);
+      const jsonbCols = ['context', 'recast_data'];
+
+      const existing = await query(
+        `SELECT id FROM deal_balance_sheet WHERE deal_id = $1 AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1`,
+        [args.deal_id]
+      );
+
+      if (existing.rows.length > 0) {
+        const updates = { ...fields };
+        delete updates.deal_id;
+        const cols = Object.keys(updates);
+        if (cols.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }] };
+        const sets = cols.map((c, i) => (jsonbCols.includes(c) ? `${c} = $${i + 1}::jsonb` : `${c} = $${i + 1}`));
+        const values = cols.map(c => updates[c]);
+        values.push(existing.rows[0].id);
+        const r = await query(`UPDATE deal_balance_sheet SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`, values);
+        return { content: [{ type: 'text', text: JSON.stringify(r.rows[0], null, 2) }] };
+      }
+
+      const cols = Object.keys(fields);
+      const placeholders = cols.map((c, i) => (jsonbCols.includes(c) ? `$${i + 1}::jsonb` : `$${i + 1}`));
+      const values = cols.map(c => fields[c]);
+      const r = await query(`INSERT INTO deal_balance_sheet (${cols.join(', ')}) VALUES (${placeholders.join(', ')}) RETURNING *`, values);
+      return { content: [{ type: 'text', text: JSON.stringify(r.rows[0], null, 2) }] };
+    }
+
+    // -- update_document (status timestamps auto-set by trigger) --
+    if (name === 'update_document') {
+      const { clause, values } = buildUpdateClause(args.updates);
+      values.push(args.document_id);
+      const r = await query(
+        `UPDATE documents SET ${clause}, updated_at = NOW() WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Document not found' }] };
+    }
+
+    // -- update_match (outcome enum; non-live outcome requires reasoning + contacted_by via DB check) --
+    if (name === 'update_match') {
+      const MATCH_OUTCOMES = ['live', 'under_loi', 'dead', 'passed', 'withdrawn', 'closed'];
+      if (args.updates && args.updates.outcome && !MATCH_OUTCOMES.includes(args.updates.outcome)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'INVALID_OUTCOME', valid: MATCH_OUTCOMES }) }] };
+      }
+      const { clause, values } = buildUpdateClause(args.updates);
+      values.push(args.match_id);
+      const r = await query(
+        `UPDATE matches SET ${clause}, updated_at = NOW() WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Match not found' }] };
+    }
+
+    // -- update_entity (jsonb: context merged, ucc_liens/officers replaced) --
+    if (name === 'update_entity') {
+      const updates = { ...args.updates };
+      const cols = Object.keys(updates);
+      if (cols.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }] };
+      const jsonbCols = ['context', 'ucc_liens', 'officers'];
+      const sets = cols.map((c, i) => {
+        if (c === 'context') return `${c} = COALESCE(${c}, '{}'::jsonb) || $${i + 1}::jsonb`;
+        if (jsonbCols.includes(c)) return `${c} = $${i + 1}::jsonb`;
+        return `${c} = $${i + 1}`;
+      });
+      const values = cols.map(c => (jsonbCols.includes(c) && typeof updates[c] === 'object' ? JSON.stringify(updates[c]) : updates[c]));
+      values.push(args.entity_id);
+      const r = await query(
+        `UPDATE entities SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${values.length} RETURNING *`,
+        values
+      );
+      return { content: [{ type: 'text', text: r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Entity not found' }] };
+    }
+
+    // -- update_broker_profile (merge broker_memory scratchpad) --
+    if (name === 'update_broker_profile') {
+      const broker = await query(`SELECT id FROM broker_profiles WHERE broker_name = $1`, [args.broker]);
+      if (broker.rows.length === 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'BROKER_NOT_FOUND', broker: args.broker }) }] };
+      }
+      const sets = [];
+      const values = [];
+      let i = 1;
+      if (args.broker_memory !== undefined) {
+        sets.push(`broker_memory = COALESCE(broker_memory, '{}'::jsonb) || $${i++}::jsonb`);
+        values.push(JSON.stringify(args.broker_memory));
+        sets.push('broker_memory_updated_at = NOW()');
+      }
+      if (args.email !== undefined) { sets.push(`email = $${i++}`); values.push(args.email); }
+      if (args.phone !== undefined) { sets.push(`phone = $${i++}`); values.push(args.phone); }
+      if (sets.length === 0) {
+        return { content: [{ type: 'text', text: 'No fields to update (provide broker_memory, email, or phone)' }] };
+      }
+      sets.push('updated_at = NOW()');
+      values.push(broker.rows[0].id);
+      const r = await query(
+        `UPDATE broker_profiles SET ${sets.join(', ')} WHERE id = $${values.length}
+         RETURNING broker_name, email, phone, broker_memory, broker_memory_updated_at`,
+        values
+      );
+      return { content: [{ type: 'text', text: JSON.stringify(r.rows[0], null, 2) }] };
     }
 
     return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
