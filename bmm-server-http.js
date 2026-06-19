@@ -41,7 +41,12 @@ if (process.env.NODE_ENV !== 'production') {
 const pool = new Pool({
   connectionString: process.env.BMM_DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10
+  // Pool hardening. connectionTimeoutMillis surfaces a starved pool.connect() as
+  // an error after 10s instead of hanging indefinitely (likely cause of the
+  // multi-minute update_match hang, since the checkout wait precedes any SQL).
+  max: 10,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000
 });
 
 const SHARED_SECRET = process.env.BMM_SHARED_SECRET;
@@ -92,6 +97,9 @@ function containsPII(text) {
 const VALID_SOURCES = ['broker', 'hal_explicit', 'hal_implicit'];
 const VALID_CATEGORIES = ['identity', 'deal_context', 'relationship', 'preference', 'observation', 'action_context'];
 const VALID_CONFIDENCE = ['high', 'medium', 'low'];
+
+// -- Valid match outcomes (shared by save_match and update_match) --
+const MATCH_OUTCOMES = ['live', 'under_loi', 'dead', 'passed', 'withdrawn', 'closed'];
 
 // -- Tool Definitions --
 const TOOLS = [
@@ -210,7 +218,7 @@ const TOOLS = [
   // == DOMAIN LOGIC: FLAGS ==
   {
     name: 'create_flag',
-    description: 'Create a flag/task for follow-up. Types: missing-doc, legal-review, valuation-needed, follow-up, data-quality, third-party. Priority: low, normal, high, urgent.',
+    description: 'Create a flag/task for follow-up. Types: missing-doc, legal-review, valuation-needed, follow-up, data-quality, third-party. Priority: low, normal, high, urgent. Pass dedupe_key for idempotent creation: if an open flag with the same dedupe_key already exists it is updated (due_date refreshed) rather than duplicated.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -221,6 +229,7 @@ const TOOLS = [
         priority: { type: 'string' },
         assigned_to: { type: 'string' },
         due_date: { type: 'string' },
+        dedupe_key: { type: 'string', description: 'Stable idempotency key. Re-creating an open flag with the same key updates it instead of inserting a duplicate. Use for recurring jobs such as the morning briefing.' },
         context: { type: 'object' },
         created_by: { type: 'string' }
       },
@@ -243,13 +252,14 @@ const TOOLS = [
   },
   {
     name: 'resolve_flag',
-    description: 'Mark a flag as resolved. If the linked contact has follow_up_interval_days set, automatically creates the next follow-up flag.',
+    description: 'Mark a flag as resolved. If the linked contact has follow_up_interval_days set, automatically creates the next follow-up flag. Pass description to set the next recurring flag text; if omitted a clean dated text is generated (the stale prior description is never copied).',
     inputSchema: {
       type: 'object',
       properties: {
         flag_id: { type: 'string' },
         resolution: { type: 'string' },
-        resolved_by: { type: 'string' }
+        resolved_by: { type: 'string' },
+        description: { type: 'string', description: 'Optional fresh text for the auto-created recurring follow-up flag. If omitted, a clean dated description is generated.' }
       },
       required: ['flag_id']
     }
@@ -356,7 +366,7 @@ const TOOLS = [
   },
   {
     name: 'create_deal',
-    description: 'Create a new deal. Deal types: listing, acquisition, valuation-only. Stages: prospect, valuation, engagement, listing-prep, active-listing, marketing, buyer-qualification, negotiation, due-diligence, closing, dead-deal.',
+    description: 'Create a new deal. Deal types: listing, acquisition, valuation-only. Stages: prospect, valuation, engagement, listing-prep, active-listing, marketing, buyer-qualification, negotiation, due-diligence, closing, closed, dead.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -509,7 +519,7 @@ const TOOLS = [
   },
   {
     name: 'save_match',
-    description: 'Save a buyer-deal match with reasoning. Match types: strong, moderate, near-miss.',
+    description: 'Save a buyer-deal match with reasoning. Match types: strong, moderate, near-miss. Pass outcome (live, under_loi, dead, passed, withdrawn, closed) to record disposition at save time; a non-live outcome requires reasoning (>=20 chars) and contacted_by.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -521,6 +531,10 @@ const TOOLS = [
         reasoning: { type: 'string' },
         matches_on: { type: 'array', items: { type: 'string' } },
         gaps: { type: 'array', items: { type: 'string' } },
+        outcome: { type: 'string', description: 'live, under_loi, dead, passed, withdrawn, closed. Non-live requires reasoning >=20 chars and contacted_by.' },
+        contacted: { type: 'boolean' },
+        contacted_by: { type: 'string', description: 'Broker who contacted the buyer. Required when outcome is non-live.' },
+        contacted_at: { type: 'string' },
         context: { type: 'object' }
       },
       required: ['deal_id', 'buyer_id', 'match_type', 'reasoning']
@@ -805,9 +819,54 @@ async function handleToolCall(name, args) {
       return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
     }
 
-    // -- create_flag --
+    // -- create_flag (dedupe gate: idempotent on dedupe_key, else exact-duplicate guard) --
     if (name === 'create_flag') {
       const fields = { ...args };
+
+      // dedupe_key is not a column. Fold it into context so it persists and can be matched.
+      const dedupeKey = fields.dedupe_key || (fields.context && fields.context.dedupe_key) || null;
+      delete fields.dedupe_key;
+      if (dedupeKey) {
+        fields.context = { ...(fields.context || {}), dedupe_key: dedupeKey };
+      }
+
+      // Dedupe gate. Mirrors the resolve_flag pattern (status != 'resolved').
+      // Primary key: dedupe_key, used by recurring jobs like the morning briefing.
+      // Fallback: block an EXACT (parent, flag_type, description) open duplicate. We
+      // deliberately do NOT dedupe on (deal_id, flag_type) alone, because one deal can
+      // legitimately carry several distinct open flags of the same type.
+      let existing = { rows: [] };
+      if (dedupeKey) {
+        const params = [dedupeKey];
+        let sql = `SELECT * FROM flags WHERE status != 'resolved' AND context->>'dedupe_key' = $1`;
+        if (fields.deal_id) { sql += ` AND deal_id = $2`; params.push(fields.deal_id); }
+        sql += ` LIMIT 1`;
+        existing = await query(sql, params);
+      } else if (fields.deal_id) {
+        existing = await query(
+          `SELECT * FROM flags WHERE status != 'resolved' AND deal_id = $1 AND flag_type = $2 AND description = $3 LIMIT 1`,
+          [fields.deal_id, fields.flag_type, fields.description]
+        );
+      } else if (fields.contact_id) {
+        existing = await query(
+          `SELECT * FROM flags WHERE status != 'resolved' AND contact_id = $1 AND flag_type = $2 AND description = $3 LIMIT 1`,
+          [fields.contact_id, fields.flag_type, fields.description]
+        );
+      }
+
+      if (existing.rows.length > 0) {
+        const hit = existing.rows[0];
+        // Re-surfacing an open item: refresh due_date if a new one was supplied, else skip.
+        if (fields.due_date) {
+          const upd = await query(
+            `UPDATE flags SET due_date = $1 WHERE id = $2 RETURNING *`,
+            [fields.due_date, hit.id]
+          );
+          return { content: [{ type: 'text', text: JSON.stringify({ deduped: true, action: 'updated_due_date', flag: upd.rows[0] }, null, 2) }] };
+        }
+        return { content: [{ type: 'text', text: JSON.stringify({ deduped: true, action: 'skipped', flag: hit }, null, 2) }] };
+      }
+
       if (fields.context) fields.context = JSON.stringify(fields.context);
 
       const columns = Object.keys(fields);
@@ -866,14 +925,19 @@ async function handleToolCall(name, args) {
             [resolvedFlag.contact_id, resolvedFlag.flag_type]
           );
           if (existing.rows.length === 0) {
+            // Do not copy resolvedFlag.description: it propagates stale text like
+            // "OVERDUE 12 DAYS...". Use a caller-supplied description if present,
+            // otherwise generate a clean dated one in SQL.
             const next = await query(
               `INSERT INTO flags (contact_id, flag_type, description, priority, assigned_to, due_date, created_by)
-               VALUES ($1, $2, $3, $4, $5, CURRENT_DATE + $6::integer, $7)
+               VALUES ($1, $2,
+                 COALESCE($3, 'Recurring follow-up due ' || to_char(CURRENT_DATE + $6::integer, 'YYYY-MM-DD')),
+                 $4, $5, CURRENT_DATE + $6::integer, $7)
                RETURNING *`,
               [
                 resolvedFlag.contact_id,
                 resolvedFlag.flag_type,
-                resolvedFlag.description,
+                args.description || null,
                 resolvedFlag.priority || 'normal',
                 resolvedFlag.assigned_to,
                 c.follow_up_interval_days,
@@ -1270,6 +1334,22 @@ async function handleToolCall(name, args) {
 
     // -- save_match --
     if (name === 'save_match') {
+      // Validate outcome (same enum as update_match) so a bad value returns a clean
+      // error instead of a raw constraint violation. The dynamic INSERT below carries
+      // outcome/contacted/contacted_by/contacted_at through automatically.
+      if (args.outcome && !MATCH_OUTCOMES.includes(args.outcome)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'INVALID_OUTCOME', valid: MATCH_OUTCOMES }) }] };
+      }
+      // A non-live outcome must satisfy matches_terminal_outcome_requires_reason:
+      // reasoning >=20 chars AND contacted_by NOT NULL. Check here for a clean error.
+      if (args.outcome && args.outcome !== 'live') {
+        if (!args.contacted_by) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'CONTACTED_BY_REQUIRED', message: 'A non-live outcome requires contacted_by.' }) }] };
+        }
+        if (!args.reasoning || args.reasoning.length < 20) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: 'REASONING_REQUIRED', message: 'A non-live outcome requires reasoning of at least 20 characters.' }) }] };
+        }
+      }
       const fields = { ...args };
       if (fields.context) fields.context = JSON.stringify(fields.context);
 
@@ -1399,7 +1479,6 @@ async function handleToolCall(name, args) {
 
     // -- update_match (outcome enum; non-live outcome requires reasoning + contacted_by via DB check) --
     if (name === 'update_match') {
-      const MATCH_OUTCOMES = ['live', 'under_loi', 'dead', 'passed', 'withdrawn', 'closed'];
       if (args.updates && args.updates.outcome && !MATCH_OUTCOMES.includes(args.updates.outcome)) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: 'INVALID_OUTCOME', valid: MATCH_OUTCOMES }) }] };
       }
