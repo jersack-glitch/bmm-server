@@ -673,6 +673,18 @@ const TOOLS = [
       },
       required: ['broker']
     }
+  },
+  {
+    name: 'update_email_archive',
+    description: 'Patch a parsed email_archive row by id (HAL write path, no full re-ingest). Editable: from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processing_notes. Corpus is immutable: message_id, body_text, sent_at, raw_size_bytes, imported_at cannot be changed. to_emails and cc_emails merge (union of existing + new) rather than replace.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archive_id: { type: 'number' },
+        updates: { type: 'object', description: 'Whitelisted fields only. to_emails/cc_emails are arrays and merge rather than replace.' }
+      },
+      required: ['archive_id', 'updates']
+    }
   }
 ];
 
@@ -1538,6 +1550,34 @@ async function handleToolCall(name, args) {
         values
       );
       return { content: [{ type: 'text', text: JSON.stringify(r.rows[0], null, 2) }] };
+    }
+
+    // -- update_email_archive (HAL write path; whitelist editable, corpus immutable) --
+    if (name === 'update_email_archive') {
+      const EDITABLE = ['from_email', 'from_name', 'to_emails', 'cc_emails', 'bmm_contact_id', 'bmm_deal_id', 'processed', 'processing_notes'];
+      const ARRAY_FIELDS = ['to_emails', 'cc_emails'];
+      const updates = args.updates || {};
+      const keys = Object.keys(updates);
+      if (keys.length === 0) return { content: [{ type: 'text', text: 'No fields to update' }] };
+      const blocked = keys.filter(k => !EDITABLE.includes(k));
+      if (blocked.length > 0) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'FIELD_NOT_EDITABLE', blocked, editable: EDITABLE, note: 'message_id, body_text, sent_at, raw_size_bytes, imported_at are immutable' }) }] };
+      }
+      const sets = keys.map((k, i) => {
+        // to_emails/cc_emails merge (union of existing + new); scalar fields replace.
+        if (ARRAY_FIELDS.includes(k)) {
+          return `${k} = (SELECT array(SELECT DISTINCT e FROM unnest(COALESCE(${k}, '{}'::text[]) || $${i + 1}::text[]) AS e))`;
+        }
+        return `${k} = $${i + 1}`;
+      });
+      const values = keys.map(k => updates[k]);
+      values.push(args.archive_id);
+      const r = await query(
+        `UPDATE email_archive SET ${sets.join(', ')} WHERE id = $${values.length}
+         RETURNING id, from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processing_notes`,
+        values
+      );
+      return { content: [{ type: 'text', text: r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Email archive row not found' }] };
     }
 
     return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
