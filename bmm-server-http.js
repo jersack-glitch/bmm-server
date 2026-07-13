@@ -101,6 +101,17 @@ const VALID_CONFIDENCE = ['high', 'medium', 'low'];
 // -- Valid match outcomes (shared by save_match and update_match) --
 const MATCH_OUTCOMES = ['live', 'under_loi', 'dead', 'passed', 'withdrawn', 'closed'];
 
+// -- Reconciliation (morning-load spec 2026-07-13) --
+const TERMINAL_OUTCOMES = ['passed', 'dead', 'withdrawn'];
+const RECON_SIGNALS = ['PASS_DECLINE', 'NDA_EXECUTED', 'DATAROOM_GRANTED', 'LOI_SIGNED', 'MEETING_OR_INFO', 'NEUTRAL'];
+// contact.context still implies pre-NDA (Check B stage-regression test). Kept in one
+// place so the flag rule and the auto-resolve rule cannot drift apart.
+const PRE_NDA_SQL = `(c.context IS NOT NULL
+    AND lower(c.context::text) ~ '(nda requested|awaiting nda|pre-?nda|send[^.,;"]{0,40}nda)'
+    AND NOT (c.context ? 'data_room_status'
+             OR lower(COALESCE(c.context->>'nda_status','')) LIKE '%execut%'))`;
+
+
 // -- Tool Definitions --
 const TOOLS = [
   // == DOMAIN LOGIC: CONTACTS ==
@@ -676,14 +687,51 @@ const TOOLS = [
   },
   {
     name: 'update_email_archive',
-    description: 'Patch a parsed email_archive row by id (HAL write path, no full re-ingest). Editable: from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processing_notes. Corpus is immutable: message_id, body_text, sent_at, raw_size_bytes, imported_at cannot be changed. to_emails and cc_emails merge (union of existing + new) rather than replace.',
+    description: 'Patch a parsed email_archive row by id (HAL write path, no full re-ingest). Editable: from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processing_notes. Corpus is immutable: message_id, body_text, sent_at, raw_size_bytes, imported_at cannot be changed. to_emails and cc_emails merge (union of existing + new) rather than replace. POST-CONDITION: processed=true requires an interaction referencing this row (context.email_archive_id or source_ref). If none exists, pass interaction:{broker, summary, ...} and it is written in the same transaction, stamped, BEFORE processed flips - if the write fails, processed stays false.',
     inputSchema: {
       type: 'object',
       properties: {
         archive_id: { type: 'number' },
-        updates: { type: 'object', description: 'Whitelisted fields only. to_emails/cc_emails are arrays and merge rather than replace.' }
+        updates: { type: 'object', description: 'Whitelisted fields only. to_emails/cc_emails are arrays and merge rather than replace.' },
+        interaction: {
+          type: 'object',
+          description: 'Interaction to write atomically when setting processed=true and no interaction references this row yet. Required: broker, summary. Optional: interaction_type (default email), direction (default from is_outgoing), occurred_at (default sent_at), notes, follow_up_date, follow_up_action, context. context.email_archive_id and source_ref are stamped automatically.',
+          properties: {
+            broker: { type: 'string' },
+            summary: { type: 'string' },
+            interaction_type: { type: 'string' },
+            direction: { type: 'string' },
+            occurred_at: { type: 'string' },
+            notes: { type: 'string' },
+            follow_up_date: { type: 'string' },
+            follow_up_action: { type: 'string' },
+            context: { type: 'object' }
+          }
+        }
       },
       required: ['archive_id', 'updates']
+    }
+  },
+  {
+    name: 'run_reconciliation',
+    description: 'Morning-load reconciliation pass (run at the top of the morning load, after email ingest, BEFORE rendering Sections 1-7 of the brief). Deterministic checks: A = orphan-processed emails (processed=true, contact resolved, no interaction ever written), C = contact context older than the newest interaction/match on an open deal. Both auto-write idempotent data-quality flags and auto-resolve them when the mismatch clears (resolved_by bmm-reconciler). Semantic check B: the response includes dispo_candidates (latest inbound email per contact+deal with a disposition keyword); classify each as PASS_DECLINE, NDA_EXECUTED, DATAROOM_GRANTED, LOI_SIGNED, MEETING_OR_INFO, or NEUTRAL and call this tool again with classifications - the server applies the flag rules and records the verdicts. Recon flags surface and PROPOSE; the broker confirms any disposition change. Render open recon flags as Section 0 "Reconcile first".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        classifications: {
+          type: 'array',
+          description: 'Verdicts for dispo_candidates from a prior call: [{archive_id, signal, confidence}]. signal: PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL. confidence: high | medium | low.',
+          items: {
+            type: 'object',
+            properties: {
+              archive_id: { type: 'number' },
+              signal: { type: 'string' },
+              confidence: { type: 'string' }
+            },
+            required: ['archive_id', 'signal']
+          }
+        }
+      }
     }
   }
 ];
@@ -897,7 +945,13 @@ async function handleToolCall(name, args) {
 
     // -- list_flags (co_broker JOIN, priority ordering) --
     if (name === 'list_flags') {
-      let sql = 'SELECT f.*, d.deal_name, c.first_name || \' \' || c.last_name AS contact_name FROM flags f LEFT JOIN deals d ON f.deal_id = d.id LEFT JOIN contacts c ON f.contact_id = c.id WHERE 1=1';
+      // deal_buyers / deal_live_buyers / deal_terminal_buyers (from v_deal_buyer_state)
+      // give the brief the deal's CURRENT buyer state at read time (spec d2a856f8, Case B),
+      // so a still-open seller/lender flag can be rendered with terminal buyers scrubbed
+      // from its description prose rather than echoing "Mark out, Weisenstine dead" verbatim.
+      // Flags are NOT excluded here: per spec, seller/lender flags naming a dead buyer are
+      // legitimately open about a live subject and must survive.
+      let sql = 'SELECT f.*, d.deal_name, c.first_name || \' \' || c.last_name AS contact_name, dbs.buyers AS deal_buyers, dbs.live_count AS deal_live_buyers, dbs.terminal_count AS deal_terminal_buyers FROM flags f LEFT JOIN deals d ON f.deal_id = d.id LEFT JOIN contacts c ON f.contact_id = c.id LEFT JOIN v_deal_buyer_state dbs ON dbs.deal_id = f.deal_id WHERE 1=1';
       const params = [];
       let idx = 1;
 
@@ -1027,11 +1081,19 @@ async function handleToolCall(name, args) {
     // -- my_followups (co_broker visibility) --
     if (name === 'my_followups') {
       const daysAhead = args.days_ahead || 7;
+      // v_action_context = open_followups enriched with matches.outcome + recency
+      // (spec d2a856f8). self_is_terminal_buyer = false EXCLUDES items whose own subject
+      // is a dead/passed/withdrawn buyer on that deal, so terminal buyers stop resurfacing
+      // in the brief (Case A). Each row also carries deal_buyers / deal_live_buyers /
+      // deal_terminal_buyers so the brief can scrub terminal names from follow-up prose
+      // instead of echoing stale text (Case B). Networking follow-ups (deal_id NULL) are
+      // never terminal and always survive.
       const result = await query(
-        `SELECT f.* FROM open_followups f
+        `SELECT f.* FROM v_action_context f
          LEFT JOIN contacts c ON f.contact_id = c.id
          WHERE (f.broker = $1 OR c.co_broker = $1)
          AND f.follow_up_date <= CURRENT_DATE + $2::integer
+         AND f.self_is_terminal_buyer = false
          ORDER BY f.follow_up_date`,
         [args.broker, daysAhead]
       );
@@ -1170,7 +1232,284 @@ async function handleToolCall(name, args) {
             session_summary: {
               active_deals: parseInt(dealCount.rows[0].count),
               open_flags: parseInt(flagCount.rows[0].count)
+            },
+            // Delivered server-side so these reach every broker on every client
+            // (Desktop clients do not read CLAUDE.md). Spec d2a856f8.
+            standing_rules: {
+              notes_section: "Render a NOTES section at the VERY TOP of the morning brief, above Section 0: all open flags with flag_type='note', one line each. These are quick read-and-dismiss-or-keep items (unpaid invoices awaiting a PAID confirmation, signed-and-final document FYIs, light tracking). The broker says dismiss (resolve_flag) or keep tracking. Auto-clear rule: when a QB/receipt PAID email arrives matching an invoice note, resolve that note with the payment fact as the resolution.",
+              reconcile_first: "At the top of the morning load, after email ingest and BEFORE rendering Sections 1-7, call run_reconciliation. If the response includes dispo_candidates, classify each (PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL) and call run_reconciliation again with classifications. Render the open data-quality recon flags as Section 0 'Reconcile first', one line each with the proposed correction. The brief does not render clean until each Section 0 item is resolved or explicitly parked. Recon flags surface and PROPOSE - the broker confirms any disposition change; never auto-disposition a contact or match from a recon flag. When correcting an orphan-processed email, log the interaction with context.email_archive_id stamped (or use update_email_archive's inline interaction) so the flag auto-resolves on the next run.",
+              morning_brief: "Names inside a follow-up or flag description are STALE PROSE, not current state. Recompute against matches before presenting the brief. my_followups already excludes terminal buyers server-side (self_is_terminal_buyer) - do not re-add them. For each flag, cross-check names in its description against deal_buyers (returned on every list_flags row): any buyer with terminal=true is dead/passed/withdrawn - never present them as a live or pending party, and scrub their name from the narrative. Do NOT resolve or delete a seller/lender flag merely because it names a dead buyer; it is legitimately open about a live subject - keep it, just scrub the dead name from how you render it.",
+              drafting: "Derive stage and disposition from matches.outcome plus the latest interaction; treat contact.context free-text as SECONDARY. Where they conflict, the interaction and match win, and the conflict is surfaced - never silently narrated one way and drafted the other. Never draft an outreach (NDA offer, data-room invite, next-step ask) from contact.context without checking it against the interaction log first.",
+              writing_flags: "Never embed a terminal buyer's disposition in a flag description (no 'Mark out, Weisenstine dead, Sarosi passed'). A dead buyer's name persisted in open-flag prose is what resurfaces in the brief. Buyer status already lives in matches.outcome; state the live fact only ('buyer pool at zero; active paths: [surviving or new only]'). Consult deal_buyers on list_flags rows for current state."
             }
+          }, null, 2)
+        }]
+      };
+    }
+
+    // -- run_reconciliation (morning-load spec 2026-07-13) --
+    // Turns email_archive <-> BMM record drift into data-quality flags. Checks A/C are
+    // deterministic (SQL views); Check B is semantic - the caller classifies the
+    // dispo_candidates and passes verdicts back via classifications, and the flag
+    // rules are applied HERE so they cannot drift between clients. Flags are
+    // idempotent on context.dedupe_key and auto-resolve when the mismatch clears.
+    // The reconciler never mutates disposition (matches/contacts/deals) - it only
+    // writes and resolves its own data-quality flags. Broker confirms corrections.
+    if (name === 'run_reconciliation') {
+      const summary = { classifications_recorded: 0, flags_created: 0, flags_refreshed: 0, flags_auto_resolved: 0 };
+      const details = { created: [], refreshed: [], auto_resolved: [], classification_results: [] };
+
+      const upsertReconFlag = async ({ dedupeKey, dealId, contactId, description, priority, assignedTo, payload }) => {
+        const ctx = { ...payload, dedupe_key: dedupeKey };
+        const existing = await query(
+          `SELECT id FROM flags WHERE status != 'resolved' AND deleted_at IS NULL AND context->>'dedupe_key' = $1 LIMIT 1`,
+          [dedupeKey]
+        );
+        if (existing.rows.length > 0) {
+          await query(
+            `UPDATE flags SET description = $1, priority = $2, assigned_to = COALESCE($3, assigned_to),
+                    context = COALESCE(context, '{}'::jsonb) || $4::jsonb, updated_at = NOW()
+             WHERE id = $5`,
+            [description, priority, assignedTo || null, JSON.stringify(ctx), existing.rows[0].id]
+          );
+          summary.flags_refreshed++;
+          details.refreshed.push(dedupeKey);
+          return existing.rows[0].id;
+        }
+        const ins = await query(
+          `INSERT INTO flags (deal_id, contact_id, flag_type, description, priority, assigned_to, status, source, created_by, context)
+           VALUES ($1, $2, 'data-quality', $3, $4, $5, 'open', 'recon:morning-load', 'bmm-reconciler', $6::jsonb)
+           RETURNING id`,
+          [dealId || null, contactId || null, description, priority, assignedTo || null, JSON.stringify(ctx)]
+        );
+        summary.flags_created++;
+        details.created.push(dedupeKey);
+        return ins.rows[0].id;
+      };
+
+      // 1. Record Check B classifications from a prior call's dispo_candidates.
+      //    Deterministic keyword pre-filter happened in the view; the caller only
+      //    classified. Flag rules run here, against live record state.
+      for (const cls of (args.classifications || [])) {
+        if (!RECON_SIGNALS.includes(cls.signal)) {
+          details.classification_results.push({ archive_id: cls.archive_id, error: 'INVALID_SIGNAL', valid: RECON_SIGNALS });
+          continue;
+        }
+        const st = await query(
+          `SELECT ea.id, ea.bmm_contact_id AS contact_id, ea.bmm_deal_id AS deal_id, ea.sent_at, ea.subject,
+                  left(ea.body_text, 280) AS preview,
+                  d.stage AS deal_stage, d.deal_name,
+                  nullif(trim(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), '') AS contact_name,
+                  ${PRE_NDA_SQL} AS pre_nda_context,
+                  m.outcome AS match_outcome,
+                  EXISTS (SELECT 1 FROM flags f
+                          WHERE f.contact_id = ea.bmm_contact_id AND f.deal_id = ea.bmm_deal_id
+                            AND f.status != 'resolved' AND f.deleted_at IS NULL
+                            AND f.flag_type = 'follow-up') AS open_followup_flag,
+                  CASE WHEN lower(COALESCE(d.assigned_broker, c.assigned_broker)) IN ('jeremy','kevin','mike')
+                       THEN initcap(lower(COALESCE(d.assigned_broker, c.assigned_broker))) END AS route_broker
+           FROM email_archive ea
+           JOIN contacts c ON c.id = ea.bmm_contact_id
+           JOIN deals d ON d.id = ea.bmm_deal_id
+           LEFT JOIN LATERAL (
+             SELECT m.outcome FROM matches m
+             WHERE m.deal_id = ea.bmm_deal_id AND m.buyer_id = ea.bmm_contact_id AND m.deleted_at IS NULL
+             ORDER BY m.updated_at DESC NULLS LAST LIMIT 1
+           ) m ON true
+           WHERE ea.id = $1`,
+          [cls.archive_id]
+        );
+        if (st.rows.length === 0) {
+          details.classification_results.push({ archive_id: cls.archive_id, error: 'ARCHIVE_ROW_NOT_FOUND_OR_UNLINKED' });
+          continue;
+        }
+        const s = st.rows[0];
+        let mismatch = false;
+        let expected = null;
+        let observed = null;
+        let description = null;
+        const sentDate = s.sent_at ? new Date(s.sent_at).toISOString().slice(0, 10) : '?';
+
+        if (cls.signal === 'PASS_DECLINE') {
+          const terminal = TERMINAL_OUTCOMES.includes(s.match_outcome || '');
+          mismatch = !terminal || s.open_followup_flag;
+          expected = 'matches.outcome in (passed|dead|withdrawn) and no open follow-up flag on the pair';
+          observed = `matches.outcome=${s.match_outcome || 'none'}, open_followup_flag=${s.open_followup_flag}`;
+          description = `Recon: latest inbound email from ${s.contact_name} (${sentDate}, "${s.subject}") reads as a pass/decline on ${s.deal_name}, but the record is not dispositioned (${observed}). Propose: broker confirm, then set matches.outcome and close any follow-up flag on the pair.`;
+        } else if (cls.signal === 'NDA_EXECUTED' || cls.signal === 'DATAROOM_GRANTED') {
+          mismatch = s.pre_nda_context === true;
+          expected = 'contact.context reflects nda_status=executed / data_room_status';
+          observed = 'contact.context still implies pre-NDA';
+          description = `Recon: archive shows ${cls.signal === 'NDA_EXECUTED' ? 'an executed NDA' : 'data-room access granted'} for ${s.contact_name} on ${s.deal_name} (${sentDate}, "${s.subject}"), but contact.context still implies pre-NDA. Stage regression risk - the buyer already advanced. Propose: refresh context (nda_status / data_room_status) from the interaction log.`;
+        } else if (cls.signal === 'LOI_SIGNED') {
+          const stageOk = ['due-diligence', 'closing', 'closed'].includes(s.deal_stage || '');
+          const outcomeOk = ['under_loi', 'closed'].includes(s.match_outcome || '');
+          mismatch = !stageOk && !outcomeOk;
+          expected = "deal.stage in (due-diligence|closing|closed) or matches.outcome in (under_loi|closed)";
+          observed = `deal.stage=${s.deal_stage || 'none'}, matches.outcome=${s.match_outcome || 'none'}`;
+          description = `Recon: archive shows an LOI signal for ${s.contact_name} on ${s.deal_name} (${sentDate}, "${s.subject}"), but the record does not reflect it (${observed}). Propose: broker confirm, then advance the deal stage / match outcome.`;
+        }
+
+        if (mismatch) {
+          await upsertReconFlag({
+            dedupeKey: `recon-dispo-${s.contact_id}-${s.deal_id}`,
+            dealId: s.deal_id,
+            contactId: s.contact_id,
+            description,
+            priority: 'high',
+            assignedTo: s.route_broker,
+            payload: {
+              check: 'B', archive_id: cls.archive_id, signal: cls.signal,
+              confidence: cls.confidence || null,
+              expected_state: expected, observed_state: observed,
+              evidence_snippet: s.preview
+            }
+          });
+        }
+        // Stamp the verdict so this email is never re-classified (the candidates
+        // view excludes processing_notes matching recon:SIGNAL).
+        await query(
+          `UPDATE email_archive SET processing_notes = COALESCE(processing_notes || ' | ', '') || $2 WHERE id = $1`,
+          [cls.archive_id, `recon:${cls.signal} ${new Date().toISOString().slice(0, 10)}${cls.confidence ? ' (' + cls.confidence + ')' : ''}`]
+        );
+        summary.classifications_recorded++;
+        details.classification_results.push({ archive_id: cls.archive_id, signal: cls.signal, flagged: mismatch });
+      }
+
+      // 2. Check A: orphan-processed emails -> one flag per archive row.
+      const orphans = await query(`SELECT * FROM v_recon_orphan_processed ORDER BY sent_at`);
+      for (const o of orphans.rows) {
+        const sentDate = o.sent_at ? new Date(o.sent_at).toISOString().slice(0, 10) : '?';
+        await upsertReconFlag({
+          dedupeKey: `recon-orphan-${o.archive_id}`,
+          dealId: o.deal_id,
+          contactId: o.contact_id,
+          description: `Recon: email ${o.archive_id} (${sentDate}, "${o.subject}", ${o.contact_name || 'unknown contact'}${o.deal_name ? ' / ' + o.deal_name : ''}) is processed=true but no interaction was ever written from it. Propose: log the interaction with context.email_archive_id stamped (update_email_archive inline interaction does this atomically), or clear the processed mark.`,
+          priority: 'high',
+          assignedTo: o.route_broker,
+          payload: {
+            check: 'A', archive_id: o.archive_id, signal: 'ORPHAN_PROCESSED',
+            expected_state: 'an interaction references this archive row (context.email_archive_id or source_ref)',
+            observed_state: `processed=true (by ${o.processed_by || '?'}) with no linking interaction`,
+            evidence_snippet: o.preview
+          }
+        });
+      }
+
+      // 3. Check C: contact context older than the newest interaction/match.
+      const stale = await query(`SELECT * FROM v_recon_context_stale ORDER BY days_stale DESC`);
+      for (const st of stale.rows) {
+        const newestSignal = [st.newest_interaction_at, st.newest_match_at]
+          .filter(Boolean).map(t => new Date(t)).sort((a, b) => b - a)[0];
+        await upsertReconFlag({
+          dedupeKey: `recon-stale-${st.contact_id}-${st.deal_id}`,
+          dealId: st.deal_id,
+          contactId: st.contact_id,
+          description: `Recon: ${st.contact_name || 'contact'} context is ${st.days_stale} days older than the newest interaction/match on ${st.deal_name}. Context may assert an older state than the record - verify against the interaction log before drafting.`,
+          priority: 'normal',
+          assignedTo: st.route_broker,
+          payload: {
+            check: 'C', signal: 'CONTEXT_STALE',
+            expected_state: 'contact.updated_at within 3 days of the newest interaction/match on the pair',
+            observed_state: `context ${st.days_stale} days older (newest signal ${newestSignal ? newestSignal.toISOString().slice(0, 10) : '?'})`,
+            evidence_snippet: null
+          }
+        });
+      }
+
+      // 4. Auto-resolve: any open recon flag whose underlying mismatch has cleared.
+      //    Mirrors the HAL past-review sweep discipline so recon flags never accumulate.
+      const openRecon = await query(
+        `SELECT id, deal_id, contact_id, context FROM flags
+         WHERE status != 'resolved' AND deleted_at IS NULL AND flag_type = 'data-quality'
+           AND context->>'dedupe_key' LIKE 'recon-%' AND context->>'check' IN ('A','B','C')`
+      );
+      for (const f of openRecon.rows) {
+        const ctx = f.context || {};
+        let cleared = false;
+        if (ctx.check === 'A') {
+          const r = await query(
+            `SELECT EXISTS (
+               SELECT 1 FROM interactions i WHERE i.deleted_at IS NULL
+                 AND (i.context->>'email_archive_id' = $1
+                      OR i.source_ref = (SELECT message_id FROM email_archive WHERE id = $2))
+             ) AS ok`,
+            [String(ctx.archive_id), ctx.archive_id]
+          );
+          cleared = r.rows[0].ok;
+        } else if (ctx.check === 'B') {
+          if (ctx.signal === 'PASS_DECLINE') {
+            const r = await query(
+              `SELECT (EXISTS (SELECT 1 FROM matches m
+                              WHERE m.deal_id = $1 AND m.buyer_id = $2 AND m.deleted_at IS NULL
+                                AND m.outcome = ANY($3::text[]))
+                       AND NOT EXISTS (SELECT 1 FROM flags f
+                                       WHERE f.contact_id = $2 AND f.deal_id = $1
+                                         AND f.status != 'resolved' AND f.deleted_at IS NULL
+                                         AND f.flag_type = 'follow-up')) AS ok`,
+              [f.deal_id, f.contact_id, TERMINAL_OUTCOMES]
+            );
+            cleared = r.rows[0].ok;
+          } else if (ctx.signal === 'NDA_EXECUTED' || ctx.signal === 'DATAROOM_GRANTED') {
+            const r = await query(
+              `SELECT NOT ${PRE_NDA_SQL} AS ok FROM contacts c WHERE c.id = $1`,
+              [f.contact_id]
+            );
+            cleared = r.rows.length > 0 && r.rows[0].ok;
+          } else if (ctx.signal === 'LOI_SIGNED') {
+            const r = await query(
+              `SELECT (d.stage IN ('due-diligence','closing','closed')
+                       OR EXISTS (SELECT 1 FROM matches m
+                                  WHERE m.deal_id = d.id AND m.buyer_id = $2 AND m.deleted_at IS NULL
+                                    AND m.outcome IN ('under_loi','closed'))) AS ok
+               FROM deals d WHERE d.id = $1`,
+              [f.deal_id, f.contact_id]
+            );
+            cleared = r.rows.length > 0 && r.rows[0].ok;
+          }
+        } else if (ctx.check === 'C') {
+          const r = await query(
+            `SELECT NOT EXISTS (SELECT 1 FROM v_recon_context_stale WHERE contact_id = $1 AND deal_id = $2) AS ok`,
+            [f.contact_id, f.deal_id]
+          );
+          cleared = r.rows[0].ok;
+        }
+        if (cleared) {
+          await query(
+            `UPDATE flags SET status = 'resolved', resolved_at = NOW(), resolved_by = 'bmm-reconciler', resolution = 'mismatch cleared' WHERE id = $1`,
+            [f.id]
+          );
+          summary.flags_auto_resolved++;
+          details.auto_resolved.push(ctx.dedupe_key || f.id);
+        }
+      }
+
+      // 5. Return reconciled state: Section 0 + candidates still needing classification.
+      const section0 = await query(
+        `SELECT f.id, f.priority, f.description, f.assigned_to, f.deal_id, f.contact_id,
+                f.context->>'check' AS check, f.context->>'signal' AS signal,
+                f.context->>'dedupe_key' AS dedupe_key, f.context AS context,
+                d.deal_name, nullif(trim(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), '') AS contact_name
+         FROM flags f
+         LEFT JOIN deals d ON d.id = f.deal_id
+         LEFT JOIN contacts c ON c.id = f.contact_id
+         WHERE f.status != 'resolved' AND f.deleted_at IS NULL AND f.flag_type = 'data-quality'
+           AND f.context->>'dedupe_key' LIKE 'recon-%'
+         ORDER BY CASE f.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 WHEN 'low' THEN 4 END, f.created_at`
+      );
+      const candidates = await query(`SELECT * FROM v_recon_dispo_candidates ORDER BY sent_at DESC`);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            summary,
+            details,
+            section_0_reconcile_first: section0.rows,
+            dispo_candidates: candidates.rows,
+            next_step: candidates.rows.length > 0
+              ? 'Classify each dispo_candidate (PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL) from its subject/preview, then call run_reconciliation again with classifications=[{archive_id, signal, confidence}]. Then render Section 0.'
+              : 'No candidates left to classify. Render Section 0 (one line per flag with the proposed correction); the brief is not clean until each item is resolved or explicitly parked. Broker confirms any disposition change.'
           }, null, 2)
         }]
       };
@@ -1553,6 +1892,11 @@ async function handleToolCall(name, args) {
     }
 
     // -- update_email_archive (HAL write path; whitelist editable, corpus immutable) --
+    // processed=true is a POST-CONDITION, not a first step (recon spec 2026-07-13):
+    // the linking interaction must exist, or be passed inline and written in the same
+    // transaction BEFORE processed flips. If the interaction write fails, processed
+    // stays false. Check A (v_recon_orphan_processed) backstops anything that slips
+    // in through other write paths.
     if (name === 'update_email_archive') {
       const EDITABLE = ['from_email', 'from_name', 'to_emails', 'cc_emails', 'bmm_contact_id', 'bmm_deal_id', 'processed', 'processing_notes'];
       const ARRAY_FIELDS = ['to_emails', 'cc_emails'];
@@ -1563,6 +1907,7 @@ async function handleToolCall(name, args) {
       if (blocked.length > 0) {
         return { content: [{ type: 'text', text: JSON.stringify({ error: 'FIELD_NOT_EDITABLE', blocked, editable: EDITABLE, note: 'message_id, body_text, sent_at, raw_size_bytes, imported_at are immutable' }) }] };
       }
+
       const sets = keys.map((k, i) => {
         // to_emails/cc_emails merge (union of existing + new); scalar fields replace.
         if (ARRAY_FIELDS.includes(k)) {
@@ -1571,13 +1916,95 @@ async function handleToolCall(name, args) {
         return `${k} = $${i + 1}`;
       });
       const values = keys.map(k => updates[k]);
-      values.push(args.archive_id);
-      const r = await query(
-        `UPDATE email_archive SET ${sets.join(', ')} WHERE id = $${values.length}
-         RETURNING id, from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processing_notes`,
-        values
+
+      // Reopening a row: clear the processing stamps so unprocessed_emails
+      // (keyed on processed_at IS NULL) picks it up again.
+      if (updates.processed === false) {
+        sets.push('processed_at = NULL', 'processed_by = NULL');
+      }
+
+      if (updates.processed !== true) {
+        values.push(args.archive_id);
+        const r = await query(
+          `UPDATE email_archive SET ${sets.join(', ')} WHERE id = $${values.length}
+           RETURNING id, from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processing_notes`,
+          values
+        );
+        return { content: [{ type: 'text', text: r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Email archive row not found' }] };
+      }
+
+      // processed=true path: enforce the post-condition.
+      const rowRes = await query(
+        `SELECT id, message_id, bmm_contact_id, bmm_deal_id, sent_at, is_outgoing, subject FROM email_archive WHERE id = $1`,
+        [args.archive_id]
       );
-      return { content: [{ type: 'text', text: r.rows.length ? JSON.stringify(r.rows[0], null, 2) : 'Email archive row not found' }] };
+      if (rowRes.rows.length === 0) return { content: [{ type: 'text', text: 'Email archive row not found' }] };
+      const row = rowRes.rows[0];
+      const effContact = updates.bmm_contact_id || row.bmm_contact_id;
+      const effDeal = updates.bmm_deal_id || row.bmm_deal_id;
+      if (!effContact && !effDeal) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'PROCESSED_REQUIRES_LINK', message: 'Never mark processed=true without bmm_contact_id or bmm_deal_id set. Link the row first (or in the same call).' }) }] };
+      }
+      const linkRes = await query(
+        `SELECT EXISTS (
+           SELECT 1 FROM interactions i WHERE i.deleted_at IS NULL
+             AND (i.context->>'email_archive_id' = $1
+                  OR ($2::text IS NOT NULL AND i.source_ref = $2))
+         ) AS ok`,
+        [String(args.archive_id), row.message_id]
+      );
+      const alreadyLinked = linkRes.rows[0].ok;
+      if (!alreadyLinked && !args.interaction) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'PROCESSED_POSTCONDITION', message: 'processed=true requires an interaction referencing this archive row (context.email_archive_id or source_ref). Pass interaction:{broker, summary, ...} to write it in the same transaction, or log_interaction with context.email_archive_id stamped first.' }) }] };
+      }
+      if (!alreadyLinked && (!args.interaction.broker || !args.interaction.summary)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'INTERACTION_FIELDS_REQUIRED', message: 'interaction.broker and interaction.summary are required.' }) }] };
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        let newInteraction = null;
+        if (!alreadyLinked) {
+          const it = args.interaction;
+          const itContext = { ...(it.context || {}), email_archive_id: String(args.archive_id) };
+          const ins = await client.query(
+            `INSERT INTO interactions (contact_id, deal_id, interaction_type, direction, broker,
+                                       occurred_at, summary, notes, follow_up_date, follow_up_action,
+                                       context, source_ref, created_by)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13) RETURNING *`,
+            [
+              effContact || null,
+              effDeal || null,
+              it.interaction_type || 'email',
+              it.direction || (row.is_outgoing ? 'outbound' : 'inbound'),
+              it.broker,
+              it.occurred_at || row.sent_at,
+              it.summary,
+              it.notes || null,
+              it.follow_up_date || null,
+              it.follow_up_action || null,
+              JSON.stringify(itContext),
+              row.message_id,
+              it.broker
+            ]
+          );
+          newInteraction = ins.rows[0];
+        }
+        const txSets = [...sets, `processed_at = NOW()`, `processed_by = $${values.length + 2}`];
+        const upd = await client.query(
+          `UPDATE email_archive SET ${txSets.join(', ')} WHERE id = $${values.length + 1}
+           RETURNING id, from_email, from_name, to_emails, cc_emails, bmm_contact_id, bmm_deal_id, processed, processed_at, processed_by, processing_notes`,
+          [...values, args.archive_id, (args.interaction && args.interaction.broker) || 'HAL']
+        );
+        await client.query('COMMIT');
+        return { content: [{ type: 'text', text: JSON.stringify({ archive: upd.rows[0], interaction: newInteraction, postcondition: alreadyLinked ? 'linking interaction already existed' : 'interaction written in the same transaction' }, null, 2) }] };
+      } catch (txErr) {
+        await client.query('ROLLBACK');
+        throw txErr;
+      } finally {
+        client.release();
+      }
     }
 
     return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
