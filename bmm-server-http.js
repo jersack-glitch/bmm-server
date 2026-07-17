@@ -1223,6 +1223,16 @@ async function handleToolCall(name, args) {
         [args.broker]
       );
 
+      // Unprocessed inbound email queue (spec 2026-07-17): emails must never
+      // black-hole. The count rides on every context load so the brief cannot
+      // miss a growing backlog even if the sweep rule is skipped.
+      const emailBacklog = await query(
+        `SELECT COUNT(*) AS count,
+                COUNT(*) FILTER (WHERE COALESCE(received_at, sent_at) < NOW() - INTERVAL '48 hours') AS stale
+         FROM email_archive
+         WHERE processed = false AND is_outgoing = false AND deleted_at IS NULL`
+      );
+
       return {
         content: [{
           type: 'text',
@@ -1231,7 +1241,9 @@ async function handleToolCall(name, args) {
             memory_entries: memory.rows,
             session_summary: {
               active_deals: parseInt(dealCount.rows[0].count),
-              open_flags: parseInt(flagCount.rows[0].count)
+              open_flags: parseInt(flagCount.rows[0].count),
+              unprocessed_inbound_emails: parseInt(emailBacklog.rows[0].count),
+              unprocessed_inbound_older_48h: parseInt(emailBacklog.rows[0].stale)
             },
             // Delivered server-side so these reach every broker on every client
             // (Desktop clients do not read CLAUDE.md). Spec d2a856f8.
@@ -1240,7 +1252,8 @@ async function handleToolCall(name, args) {
               reconcile_first: "At the top of the morning load, after email ingest and BEFORE rendering Sections 1-7, call run_reconciliation. If the response includes dispo_candidates, classify each (PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL) and call run_reconciliation again with classifications. Render the open data-quality recon flags as Section 0 'Reconcile first', one line each with the proposed correction. The brief does not render clean until each Section 0 item is resolved or explicitly parked. Recon flags surface and PROPOSE - the broker confirms any disposition change; never auto-disposition a contact or match from a recon flag. When correcting an orphan-processed email, log the interaction with context.email_archive_id stamped (or use update_email_archive's inline interaction) so the flag auto-resolves on the next run.",
               morning_brief: "Names inside a follow-up or flag description are STALE PROSE, not current state. Recompute against matches before presenting the brief. my_followups already excludes terminal buyers server-side (self_is_terminal_buyer) - do not re-add them. For each flag, cross-check names in its description against deal_buyers (returned on every list_flags row): any buyer with terminal=true is dead/passed/withdrawn - never present them as a live or pending party, and scrub their name from the narrative. Do NOT resolve or delete a seller/lender flag merely because it names a dead buyer; it is legitimately open about a live subject - keep it, just scrub the dead name from how you render it.",
               drafting: "Derive stage and disposition from matches.outcome plus the latest interaction; treat contact.context free-text as SECONDARY. Where they conflict, the interaction and match win, and the conflict is surfaced - never silently narrated one way and drafted the other. Never draft an outreach (NDA offer, data-room invite, next-step ask) from contact.context without checking it against the interaction log first.",
-              writing_flags: "Never embed a terminal buyer's disposition in a flag description (no 'Mark out, Weisenstine dead, Sarosi passed'). A dead buyer's name persisted in open-flag prose is what resurfaces in the brief. Buyer status already lives in matches.outcome; state the live fact only ('buyer pool at zero; active paths: [surviving or new only]'). Consult deal_buyers on list_flags rows for current state."
+              writing_flags: "Never embed a terminal buyer's disposition in a flag description (no 'Mark out, Weisenstine dead, Sarosi passed'). A dead buyer's name persisted in open-flag prose is what resurfaces in the brief. Buyer status already lives in matches.outcome; state the live fact only ('buyer pool at zero; active paths: [surviving or new only]'). Consult deal_buyers on list_flags rows for current state.",
+              new_lead_sweep: "Emails must NEVER black-hole (spec 2026-07-17). Every morning brief surfaces session_summary.unprocessed_inbound_emails; if it is nonzero, render it as a line in the brief and, after Section 0, triage the queue (email_archive WHERE processed=false AND is_outgoing=false AND deleted_at IS NULL). The ingest already auto-links known senders and turns structured listing leads (Murphy site Contact Request, BizBuySell) into priority-high note flags. What remains needs judgment: real human with lead or deal relevance -> propose a new contact + follow-up flag, broker confirms before creation; missed existing contact (alt address or name variant) -> log the interaction, set bmm_contact_id, mark processed; bulk/vendor/internal chatter -> mark processed with an explanatory processing_note (processed_by='HAL-triage'; a documented SQL-set processed is the accepted PROCESSED_REQUIRES_LINK exception when no CRM link is possible). Origin: 2026-07-17 audit found 299 rows accumulated since May, four unseen listing leads among them."
             }
           }, null, 2)
         }]
