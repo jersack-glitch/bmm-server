@@ -714,10 +714,11 @@ const TOOLS = [
   },
   {
     name: 'run_reconciliation',
-    description: 'Morning-load reconciliation pass (run at the top of the morning load, after email ingest, BEFORE rendering Sections 1-7 of the brief). Deterministic checks: A = orphan-processed emails (processed=true, contact resolved, no interaction ever written), C = contact context older than the newest interaction/match on an open deal. Both auto-write idempotent data-quality flags and auto-resolve them when the mismatch clears (resolved_by bmm-reconciler). Semantic check B: the response includes dispo_candidates (latest inbound email per contact+deal with a disposition keyword); classify each as PASS_DECLINE, NDA_EXECUTED, DATAROOM_GRANTED, LOI_SIGNED, MEETING_OR_INFO, or NEUTRAL and call this tool again with classifications - the server applies the flag rules and records the verdicts. Recon flags surface and PROPOSE; the broker confirms any disposition change. Render open recon flags as Section 0 "Reconcile first".',
+    description: 'Morning-load reconciliation pass (run at the top of the morning load, after email ingest, BEFORE rendering Sections 1-7 of the brief). Deterministic checks: A = orphan-processed emails (processed=true, contact resolved, no interaction ever written), C = contact context older than the newest interaction/match on an open deal. Both auto-write idempotent data-quality flags and auto-resolve them when the mismatch clears (resolved_by bmm-reconciler). Semantic check B: the response includes dispo_candidates (latest inbound email per contact+deal with a disposition keyword); classify each as PASS_DECLINE, NDA_EXECUTED, DATAROOM_GRANTED, LOI_SIGNED, MEETING_OR_INFO, or NEUTRAL and call this tool again with classifications - the server applies the flag rules and records the verdicts. Recon flags surface and PROPOSE; the broker confirms any disposition change. Render open recon flags as Section 0 "Reconcile first". Pass broker (Jeremy|Kevin|Mike): the email-derived checks (A orphan, B classification) and dispo_candidates run ONLY for the broker who ingests email; every broker still gets Check C (context-stale) and their own Section 0.',
     inputSchema: {
       type: 'object',
       properties: {
+        broker: { type: 'string', description: 'Broker running the pass: Jeremy, Kevin, or Mike. Email-derived checks (A orphan, B classification) and dispo_candidates run only for the broker who ingests email; Section 0 is scoped to this broker.' },
         classifications: {
           type: 'array',
           description: 'Verdicts for dispo_candidates from a prior call: [{archive_id, signal, confidence}]. signal: PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL. confidence: high | medium | low.',
@@ -731,7 +732,8 @@ const TOOLS = [
             required: ['archive_id', 'signal']
           }
         }
-      }
+      },
+      required: ['broker']
     }
   }
 ];
@@ -1226,12 +1228,22 @@ async function handleToolCall(name, args) {
       // Unprocessed inbound email queue (spec 2026-07-17): emails must never
       // black-hole. The count rides on every context load so the brief cannot
       // miss a growing backlog even if the sweep rule is skipped.
+      // Per-broker scoping (2026-07-19): the backlog is the INGESTING broker's inbox,
+      // not a BMM-global queue. email_archive.account is the mailbox each row came from,
+      // and broker_profiles.email is that same address for the broker who ingests it
+      // (Jeremy = j.sacker@murphybusiness.com on 100% of rows today). Scope the count to
+      // this broker's account; hasIngest = they have any archived mail at all. Kevin/Mike
+      // do not ingest, so they get null counts and no new_lead_sweep rule.
       const emailBacklog = await query(
-        `SELECT COUNT(*) AS count,
-                COUNT(*) FILTER (WHERE COALESCE(received_at, sent_at) < NOW() - INTERVAL '48 hours') AS stale
+        `SELECT COUNT(*) FILTER (WHERE processed = false AND is_outgoing = false) AS count,
+                COUNT(*) FILTER (WHERE processed = false AND is_outgoing = false
+                                 AND COALESCE(received_at, sent_at) < NOW() - INTERVAL '48 hours') AS stale,
+                COUNT(*) AS account_rows
          FROM email_archive
-         WHERE processed = false AND is_outgoing = false AND deleted_at IS NULL`
+         WHERE account = $1 AND deleted_at IS NULL`,
+        [profile.email]
       );
+      const hasIngest = parseInt(emailBacklog.rows[0].account_rows) > 0;
 
       return {
         content: [{
@@ -1242,18 +1254,18 @@ async function handleToolCall(name, args) {
             session_summary: {
               active_deals: parseInt(dealCount.rows[0].count),
               open_flags: parseInt(flagCount.rows[0].count),
-              unprocessed_inbound_emails: parseInt(emailBacklog.rows[0].count),
-              unprocessed_inbound_older_48h: parseInt(emailBacklog.rows[0].stale)
+              unprocessed_inbound_emails: hasIngest ? parseInt(emailBacklog.rows[0].count) : null,
+              unprocessed_inbound_older_48h: hasIngest ? parseInt(emailBacklog.rows[0].stale) : null
             },
             // Delivered server-side so these reach every broker on every client
             // (Desktop clients do not read CLAUDE.md). Spec d2a856f8.
             standing_rules: {
-              notes_section: "Render a NOTES section at the VERY TOP of the morning brief, above Section 0: all open flags with flag_type='note', one line each. These are quick read-and-dismiss-or-keep items (unpaid invoices awaiting a PAID confirmation, signed-and-final document FYIs, light tracking). The broker says dismiss (resolve_flag) or keep tracking. Auto-clear rule: when a QB/receipt PAID email arrives matching an invoice note, resolve that note with the payment fact as the resolution.",
-              reconcile_first: "At the top of the morning load, after email ingest and BEFORE rendering Sections 1-7, call run_reconciliation. If the response includes dispo_candidates, classify each (PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL) and call run_reconciliation again with classifications. Render the open data-quality recon flags as Section 0 'Reconcile first', one line each with the proposed correction. The brief does not render clean until each Section 0 item is resolved or explicitly parked. Recon flags surface and PROPOSE - the broker confirms any disposition change; never auto-disposition a contact or match from a recon flag. When correcting an orphan-processed email, log the interaction with context.email_archive_id stamped (or use update_email_archive's inline interaction) so the flag auto-resolves on the next run.",
+              notes_section: "Render a NOTES section at the VERY TOP of the morning brief, above Section 0: YOUR open flags with flag_type='note' (call list_flags with assigned_to=<your broker name> and filter flag_type='note'; never render another broker's note flags), one line each. These are quick read-and-dismiss-or-keep items (unpaid invoices awaiting a PAID confirmation, signed-and-final document FYIs, light tracking). The broker says dismiss (resolve_flag) or keep tracking. Auto-clear rule: when a QB/receipt PAID email arrives matching an invoice note, resolve that note with the payment fact as the resolution.",
+              reconcile_first: "At the top of the morning load, after email ingest and BEFORE rendering Sections 1-7, call run_reconciliation with broker=<your broker name> (the email-derived checks and dispo_candidates run only for the broker who ingests email; every broker still gets their own Section 0 and the Check C context-stale items). If the response includes dispo_candidates, classify each (PASS_DECLINE | NDA_EXECUTED | DATAROOM_GRANTED | LOI_SIGNED | MEETING_OR_INFO | NEUTRAL) and call run_reconciliation again with classifications. Render the open data-quality recon flags as Section 0 'Reconcile first', one line each with the proposed correction. The brief does not render clean until each Section 0 item is resolved or explicitly parked. Recon flags surface and PROPOSE - the broker confirms any disposition change; never auto-disposition a contact or match from a recon flag. When correcting an orphan-processed email, log the interaction with context.email_archive_id stamped (or use update_email_archive's inline interaction) so the flag auto-resolves on the next run.",
               morning_brief: "Names inside a follow-up or flag description are STALE PROSE, not current state. Recompute against matches before presenting the brief. my_followups already excludes terminal buyers server-side (self_is_terminal_buyer) - do not re-add them. For each flag, cross-check names in its description against deal_buyers (returned on every list_flags row): any buyer with terminal=true is dead/passed/withdrawn - never present them as a live or pending party, and scrub their name from the narrative. Do NOT resolve or delete a seller/lender flag merely because it names a dead buyer; it is legitimately open about a live subject - keep it, just scrub the dead name from how you render it.",
               drafting: "Derive stage and disposition from matches.outcome plus the latest interaction; treat contact.context free-text as SECONDARY. Where they conflict, the interaction and match win, and the conflict is surfaced - never silently narrated one way and drafted the other. Never draft an outreach (NDA offer, data-room invite, next-step ask) from contact.context without checking it against the interaction log first.",
               writing_flags: "Never embed a terminal buyer's disposition in a flag description (no 'Mark out, Weisenstine dead, Sarosi passed'). A dead buyer's name persisted in open-flag prose is what resurfaces in the brief. Buyer status already lives in matches.outcome; state the live fact only ('buyer pool at zero; active paths: [surviving or new only]'). Consult deal_buyers on list_flags rows for current state.",
-              new_lead_sweep: "Emails must NEVER black-hole (spec 2026-07-17). Every morning brief surfaces session_summary.unprocessed_inbound_emails; if it is nonzero, render it as a line in the brief and, after Section 0, triage the queue (email_archive WHERE processed=false AND is_outgoing=false AND deleted_at IS NULL). The ingest already auto-links known senders and turns structured listing leads (Murphy site Contact Request, BizBuySell) into priority-high note flags. What remains needs judgment: real human with lead or deal relevance -> propose a new contact + follow-up flag, broker confirms before creation; missed existing contact (alt address or name variant) -> log the interaction, set bmm_contact_id, mark processed; bulk/vendor/internal chatter -> mark processed with an explanatory processing_note (processed_by='HAL-triage'; a documented SQL-set processed is the accepted PROCESSED_REQUIRES_LINK exception when no CRM link is possible). Origin: 2026-07-17 audit found 299 rows accumulated since May, four unseen listing leads among them."
+              ...(hasIngest ? { new_lead_sweep: "Emails must NEVER black-hole (spec 2026-07-17). Every morning brief surfaces session_summary.unprocessed_inbound_emails; if it is nonzero, render it as a line in the brief and, after Section 0, triage YOUR queue (email_archive WHERE processed=false AND is_outgoing=false AND deleted_at IS NULL AND account='" + profile.email + "'). The ingest already auto-links known senders and turns structured listing leads (Murphy site Contact Request, BizBuySell) into priority-high note flags. What remains needs judgment: real human with lead or deal relevance -> propose a new contact + follow-up flag, broker confirms before creation; missed existing contact (alt address or name variant) -> log the interaction, set bmm_contact_id, mark processed; bulk/vendor/internal chatter -> mark processed with an explanatory processing_note (processed_by='HAL-triage'; a documented SQL-set processed is the accepted PROCESSED_REQUIRES_LINK exception when no CRM link is possible). Origin: 2026-07-17 audit found 299 rows accumulated since May, four unseen listing leads among them." } : {})
             }
           }, null, 2)
         }]
@@ -1271,6 +1283,27 @@ async function handleToolCall(name, args) {
     if (name === 'run_reconciliation') {
       const summary = { classifications_recorded: 0, flags_created: 0, flags_refreshed: 0, flags_auto_resolved: 0 };
       const details = { created: [], refreshed: [], auto_resolved: [], classification_results: [] };
+
+      // Per-broker scoping (2026-07-19): run_reconciliation now requires a broker.
+      // The email-derived checks (A orphan-processed, B disposition classification) and
+      // dispo_candidates belong to the broker who INGESTS email - they read that broker's
+      // inbox and its body previews, so a non-ingesting broker (Kevin/Mike) must neither
+      // run them nor be handed them. isIngesting = this broker's broker_profiles.email
+      // matches an email_archive.account carrying rows. Check C (context-stale, no email
+      // body) stays universal; Section 0 is scoped to the caller below.
+      if (!args.broker) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'BROKER_REQUIRED', message: 'run_reconciliation requires a broker argument (Jeremy, Kevin, or Mike) so email reconciliation is scoped to the ingesting broker.' }) }] };
+      }
+      const ingestCheck = await query(
+        `SELECT EXISTS (
+           SELECT 1 FROM email_archive ea
+           JOIN broker_profiles bp ON bp.email = ea.account
+           WHERE bp.broker_name = $1 AND ea.deleted_at IS NULL
+         ) AS ok`,
+        [args.broker]
+      );
+      const isIngesting = ingestCheck.rows[0].ok;
+      const classifications = isIngesting ? (args.classifications || []) : [];
 
       const upsertReconFlag = async ({ dedupeKey, dealId, contactId, description, priority, assignedTo, payload }) => {
         const ctx = { ...payload, dedupe_key: dedupeKey };
@@ -1303,7 +1336,7 @@ async function handleToolCall(name, args) {
       // 1. Record Check B classifications from a prior call's dispo_candidates.
       //    Deterministic keyword pre-filter happened in the view; the caller only
       //    classified. Flag rules run here, against live record state.
-      for (const cls of (args.classifications || [])) {
+      for (const cls of classifications) {
         if (!RECON_SIGNALS.includes(cls.signal)) {
           details.classification_results.push({ archive_id: cls.archive_id, error: 'INVALID_SIGNAL', valid: RECON_SIGNALS });
           continue;
@@ -1370,7 +1403,7 @@ async function handleToolCall(name, args) {
             contactId: s.contact_id,
             description,
             priority: 'high',
-            assignedTo: s.route_broker,
+            assignedTo: args.broker,
             payload: {
               check: 'B', archive_id: cls.archive_id, signal: cls.signal,
               confidence: cls.confidence || null,
@@ -1390,7 +1423,10 @@ async function handleToolCall(name, args) {
       }
 
       // 2. Check A: orphan-processed emails -> one flag per archive row.
-      const orphans = await query(`SELECT * FROM v_recon_orphan_processed ORDER BY sent_at`);
+      //    Email-derived: runs only for the ingesting broker.
+      const orphans = isIngesting
+        ? await query(`SELECT * FROM v_recon_orphan_processed ORDER BY sent_at`)
+        : { rows: [] };
       for (const o of orphans.rows) {
         const sentDate = o.sent_at ? new Date(o.sent_at).toISOString().slice(0, 10) : '?';
         await upsertReconFlag({
@@ -1399,7 +1435,7 @@ async function handleToolCall(name, args) {
           contactId: o.contact_id,
           description: `Recon: email ${o.archive_id} (${sentDate}, "${o.subject}", ${o.contact_name || 'unknown contact'}${o.deal_name ? ' / ' + o.deal_name : ''}) is processed=true but no interaction was ever written from it. Propose: log the interaction with context.email_archive_id stamped (update_email_archive inline interaction does this atomically), or clear the processed mark.`,
           priority: 'high',
-          assignedTo: o.route_broker,
+          assignedTo: args.broker,
           payload: {
             check: 'A', archive_id: o.archive_id, signal: 'ORPHAN_PROCESSED',
             expected_state: 'an interaction references this archive row (context.email_archive_id or source_ref)',
@@ -1508,9 +1544,13 @@ async function handleToolCall(name, args) {
          LEFT JOIN contacts c ON c.id = f.contact_id
          WHERE f.status != 'resolved' AND f.deleted_at IS NULL AND f.flag_type = 'data-quality'
            AND f.context->>'dedupe_key' LIKE 'recon-%'
-         ORDER BY CASE f.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 WHEN 'low' THEN 4 END, f.created_at`
+           AND (f.assigned_to = $1 OR f.assigned_to IS NULL)
+         ORDER BY CASE f.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'normal' THEN 3 WHEN 'low' THEN 4 END, f.created_at`,
+        [args.broker]
       );
-      const candidates = await query(`SELECT * FROM v_recon_dispo_candidates ORDER BY sent_at DESC`);
+      const candidates = isIngesting
+        ? await query(`SELECT * FROM v_recon_dispo_candidates ORDER BY sent_at DESC`)
+        : { rows: [] };
 
       return {
         content: [{
