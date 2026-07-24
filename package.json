@@ -5,7 +5,8 @@
   "main": "bmm-server-http.js",
   "scripts": {
     "start": "node bmm-server-http.js",
-    "dev": "node bmm-server-http.js"
+    "dev": "node bmm-server-http.js",
+    "tokens": "node manage-tokens.js"
   },
   "engines": {
     "node": ">=18.0.0"
