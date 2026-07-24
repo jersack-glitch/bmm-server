@@ -8,18 +8,34 @@
 // Transport: Streamable HTTP (single /mcp endpoint, stateless). SSE is deprecated.
 //
 // Required env vars (set in Render dashboard):
-//   BMM_DATABASE_URL   — Supabase transaction pooler connection string
-//   BMM_SHARED_SECRET  — shared secret; clients pass it in the connector URL as ?token=<secret>
-//   PORT               — auto-set by Render
-//   NODE_ENV           — set to "production" on Render (skips local .env load)
+//   BMM_DATABASE_URL     — Supabase transaction pooler connection string
+//   PORT                 — auto-set by Render
+//   NODE_ENV             — set to "production" on Render (skips local .env load)
+// Optional:
+//   BMM_SHARED_SECRET    — legacy single shared secret. Still honored so existing
+//                          connectors keep working; unset it once every broker has
+//                          a per-identity token (see supabase/mcp_auth.sql and
+//                          manage-tokens.js).
+//   BMM_DATABASE_CA_CERT — Supabase CA certificate (PEM, or base64 of the PEM).
+//                          When set, DB TLS is fully verified; when absent the
+//                          pool falls back to rejectUnauthorized:false.
 //
-// claude.ai / Claude Desktop Custom Connector config:
-//   URL:  https://YOUR-APP.onrender.com/mcp?token=<BMM_SHARED_SECRET>
+// Auth: per-identity tokens in the mcp_token table (sha256-hashed at rest, with
+// scopes / expiry / revocation) checked on every request; every tool call is
+// written to mcp_audit_log with the caller's identity. Scopes support deny
+// entries ('!raw_query') on top of '*'/allowlist, so broker tokens can be
+// "everything except". In production, requests with no valid credential are
+// rejected — there is no open mode. Outside production, running with neither
+// BMM_SHARED_SECRET nor a presented token stays open for local dev.
+//
+// claude.ai / Claude Desktop Custom Connector config (one token per broker):
+//   URL:  https://YOUR-APP.onrender.com/mcp?token=<per-broker token>
 //   Auth: None
 //
 // (Claude's connector UI has no bearer-token/custom-header field — it only offers
-//  "None" or OAuth — so the secret rides in the URL. OAuth can be added later
-//  without touching the tools or transport.)
+//  "None" or OAuth — so the token rides in the URL. Bearer / x-api-key headers are
+//  also accepted for clients that support them. OAuth can be added later without
+//  touching the tools or transport.)
 
 const express = require('express');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
@@ -30,6 +46,7 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 const { Pool } = require('pg');
 const path = require('path');
+const crypto = require('crypto');
 
 // Local dev reads .env.bmm; Render injects env vars directly.
 if (process.env.NODE_ENV !== 'production') {
@@ -38,9 +55,21 @@ if (process.env.NODE_ENV !== 'production') {
   } catch (_) {}
 }
 
+// Full TLS verification when the Supabase CA cert is provided (PEM or base64 PEM);
+// otherwise fall back to the old unverified mode so existing deploys keep working.
+function dbSsl() {
+  const raw = process.env.BMM_DATABASE_CA_CERT;
+  if (!raw) {
+    console.warn('BMM_DATABASE_CA_CERT not set — DB TLS is unverified (rejectUnauthorized:false).');
+    return { rejectUnauthorized: false };
+  }
+  const ca = raw.includes('-----BEGIN') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+  return { ca, rejectUnauthorized: true };
+}
+
 const pool = new Pool({
   connectionString: process.env.BMM_DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: dbSsl(),
   // Pool hardening. connectionTimeoutMillis surfaces a starved pool.connect() as
   // an error after 10s instead of hanging indefinitely (likely cause of the
   // multi-minute update_match hang, since the checkout wait precedes any SQL).
@@ -50,6 +79,7 @@ const pool = new Pool({
 });
 
 const SHARED_SECRET = process.env.BMM_SHARED_SECRET;
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 // -- Helper: run query and return result --
 async function query(sql, params = []) {
@@ -739,7 +769,46 @@ const TOOLS = [
 ];
 
 // -- Tool Handlers (domain logic - identical to bmm-server.js stdio) --
-async function handleToolCall(name, args) {
+// -- Audit --
+// Fire-and-forget: an audit-write failure must never fail the tool call itself.
+// Args are stored as jsonb, truncated past 10KB to keep rows bounded.
+function writeAudit(identity, tool, args, ok, error, durationMs) {
+  let payload = JSON.stringify(args ?? {});
+  if (payload.length > 10000) {
+    payload = JSON.stringify({ _truncated: true, preview: payload.slice(0, 10000) });
+  }
+  query(
+    `INSERT INTO mcp_audit_log (token_id, identity, tool, args, ok, error, duration_ms)
+     VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)`,
+    [identity.tokenId || null, identity.label, tool, payload, ok, error || null, durationMs]
+  ).catch(err => console.error('audit write failed:', err.message));
+}
+
+// Scopes: '*' = all tools, bare names allowlist, '!name' denies even against '*'
+// (so a broker token can be "everything except raw_query": scopes = {*,!raw_query}).
+function scopeAllows(scopes, tool) {
+  if (!Array.isArray(scopes)) return false;
+  if (scopes.includes(`!${tool}`)) return false;
+  return scopes.includes('*') || scopes.includes(tool);
+}
+
+// Scope check + audit wrapper; dispatchToolCall below holds the per-tool logic.
+async function handleToolCall(name, args, identity) {
+  if (!scopeAllows(identity.scopes, name)) {
+    writeAudit(identity, name, args, false, 'scope denied', 0);
+    return {
+      content: [{ type: 'text', text: JSON.stringify({ error: `Tool "${name}" is not permitted for this token.` }, null, 2) }],
+      isError: true
+    };
+  }
+  const started = Date.now();
+  const result = await dispatchToolCall(name, args);
+  const errorText = result.isError ? String(result.content?.[0]?.text || '').slice(0, 500) : null;
+  writeAudit(identity, name, args, !result.isError, errorText, Date.now() - started);
+  return result;
+}
+
+async function dispatchToolCall(name, args) {
   try {
     // -- create_contact (dedup gate) --
     if (name === 'create_contact') {
@@ -2063,7 +2132,7 @@ async function handleToolCall(name, args) {
       }
     }
 
-    return { content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
+    return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
 
   } catch (error) {
     return {
@@ -2075,13 +2144,14 @@ async function handleToolCall(name, args) {
           detail: error.detail || null,
           hint: error.hint || null
         })
-      }]
+      }],
+      isError: true
     };
   }
 }
 
 // -- MCP Server factory (one instance per request in stateless mode) --
-function createMcpServer() {
+function createMcpServer(identity) {
   const server = new Server(
     { name: 'bmm-server', version: '2.1.0' },
     { capabilities: { tools: {} } }
@@ -2089,24 +2159,85 @@ function createMcpServer() {
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
-    return handleToolCall(name, args || {});
+    return handleToolCall(name, args || {}, identity);
   });
   return server;
 }
 
-// -- Auth: shared secret --
-// Primary path is the URL token (?token=<secret>), because Claude's connector UI
+// -- Auth: per-identity tokens (mcp_token table) + legacy shared secret --
+// Primary path is the URL token (?token=...), because Claude's connector UI
 // has no bearer/header field. Header forms are still accepted for API/testing use.
-function auth(req, res, next) {
-  if (!SHARED_SECRET) return next(); // dev: no secret configured = open
+//
+// Order matters for zero-risk rollout: the legacy secret is checked first and
+// needs no DB, so this deploys safely before the mcp_auth.sql migration runs.
+// Token hits are cached for TTL_MS, so revocation takes effect within ~30s.
+const TOKEN_CACHE_TTL_MS = 30000;
+const tokenCache = new Map(); // sha256hex -> { identity, fetchedAt }
+const lastUsedWritten = new Map(); // token id -> ms timestamp of last last_used_at write
+
+function sha256hex(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
+}
+
+function timingSafeMatch(a, b) {
+  // Compare digests so unequal lengths can't short-circuit.
+  return crypto.timingSafeEqual(Buffer.from(sha256hex(a), 'hex'), Buffer.from(sha256hex(b), 'hex'));
+}
+
+async function lookupToken(rawToken) {
+  const hash = sha256hex(rawToken);
+  const cached = tokenCache.get(hash);
+  if (cached && Date.now() - cached.fetchedAt < TOKEN_CACHE_TTL_MS) return cached.identity;
+  const r = await query(
+    `SELECT id, label, scopes FROM mcp_token
+     WHERE token_hash = $1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())`,
+    [hash]
+  );
+  if (!r.rows.length) {
+    tokenCache.delete(hash);
+    return null;
+  }
+  const identity = { tokenId: r.rows[0].id, label: r.rows[0].label, scopes: r.rows[0].scopes };
+  tokenCache.set(hash, { identity, fetchedAt: Date.now() });
+  const lastWrite = lastUsedWritten.get(identity.tokenId) || 0;
+  if (Date.now() - lastWrite > 60000) {
+    lastUsedWritten.set(identity.tokenId, Date.now());
+    query(`UPDATE mcp_token SET last_used_at = now() WHERE id = $1`, [identity.tokenId])
+      .catch(err => console.error('last_used_at update failed:', err.message));
+  }
+  return identity;
+}
+
+async function auth(req, res, next) {
   const token =
     req.query.token ||
     (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '') ||
     req.headers['x-api-key'];
-  if (token !== SHARED_SECRET) {
+
+  if (!token) {
+    // Open mode is a local-dev convenience only; production always fails closed.
+    if (!IS_PRODUCTION && !SHARED_SECRET) {
+      req.mcpIdentity = { tokenId: null, label: 'open-dev', scopes: ['*'] };
+      return next();
+    }
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  next();
+
+  if (SHARED_SECRET && timingSafeMatch(token, SHARED_SECRET)) {
+    req.mcpIdentity = { tokenId: null, label: 'legacy-shared-secret', scopes: ['*'] };
+    return next();
+  }
+
+  try {
+    const identity = await lookupToken(token);
+    if (!identity) return res.status(401).json({ error: 'Unauthorized' });
+    req.mcpIdentity = identity;
+    return next();
+  } catch (err) {
+    // Fail closed: a DB error during lookup must not let the request through.
+    console.error('token lookup failed:', err.message);
+    return res.status(503).json({ error: 'Auth backend unavailable' });
+  }
 }
 
 // -- Express app --
@@ -2120,7 +2251,7 @@ app.get('/health', (req, res) => {
 
 // MCP endpoint — Streamable HTTP, stateless. claude.ai connects here.
 app.post('/mcp', auth, async (req, res) => {
-  const server = createMcpServer();
+  const server = createMcpServer(req.mcpIdentity);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => {
     transport.close();
@@ -2154,5 +2285,10 @@ app.delete('/mcp', methodNotAllowed);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`BMM MCP Server v2.1 (Streamable HTTP) running on port ${PORT}`);
+  console.log(`BMM MCP Server v2.2 (Streamable HTTP) running on port ${PORT}`);
+  console.log(`Auth: per-identity tokens${SHARED_SECRET ? ' + legacy shared secret (unset BMM_SHARED_SECRET once broker connectors are migrated)' : ''}${!IS_PRODUCTION && !SHARED_SECRET ? ' (dev open mode — no credential required)' : ''}`);
+  // Best-effort visibility at boot; the server still starts if the DB is down.
+  query(`SELECT count(*)::int AS n FROM mcp_token WHERE revoked_at IS NULL`)
+    .then(r => console.log(`Live tokens: ${r.rows[0].n}`))
+    .catch(err => console.warn(`Could not count tokens (has supabase/mcp_auth.sql been run?): ${err.message}`));
 });
